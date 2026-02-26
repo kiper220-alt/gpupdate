@@ -134,6 +134,12 @@ class smbcreds (smbopts):
                     pdc_dns_name = info.get('pdc_dns_name')
                     if pdc_dns_name:
                         Dconf_registry.set_info('pdc_dns_name', pdc_dns_name)
+                        if '@' in username:
+                            user_part, domain_part = username.rsplit('@', 1)
+                            pdc_parts = pdc_dns_name.lower().split('.')
+                            domain_parts = domain_part.lower().split('.')
+                            if pdc_parts[-len(domain_parts):] == domain_parts:
+                                username = user_part
                         gpos = get_gpo_list(pdc_dns_name, self.creds, self.lp, username)
                         logdata = {'username': username}
                         log('I12', logdata)
