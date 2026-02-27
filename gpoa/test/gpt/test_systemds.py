@@ -69,11 +69,14 @@ class GptSystemdsTestCase(unittest.TestCase):
         import gpt.systemds
 
         items = gpt.systemds.read_systemds(self._path('Systemds_invalid.xml'))
-        # good + bad-dep (kept with filtered deps)
+        # good + bad-dep (kept with filtered deps); invalid path values are skipped
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0].unit, 'good.service')
         self.assertEqual(items[1].unit, 'bad3.service')
         self.assertEqual(items[1].file_dependencies, [])
+        units = {item.unit for item in items}
+        self.assertNotIn('../../tmp/evil.service', units)
+        self.assertNotIn('safe.service', units)
 
     def test_merge_systemds(self):
         import gpt.systemds

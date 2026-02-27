@@ -22,6 +22,7 @@ import sys
 import types
 import importlib
 import tempfile
+import unittest.mock
 
 
 def _load_change_journal():
@@ -93,6 +94,21 @@ class ChangeJournalTestCase(unittest.TestCase):
         change_journal.record_presence_changed('/tmp/b')
         self.assertTrue(change_journal.query('/tmp/b', mode='changed'))
         self.assertTrue(change_journal.query('/tmp/b', mode='presence_changed'))
+
+    def test_query_reuses_current_snapshot_cache(self):
+        change_journal = _load_change_journal()
+        change_journal.reset()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'cache.txt')
+            with open(path, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('content')
+            change_journal.watch(path)
+
+            with unittest.mock.patch.object(change_journal, '_sha256', wraps=change_journal._sha256) as hash_mock:
+                self.assertFalse(change_journal.query(path, mode='changed'))
+                self.assertFalse(change_journal.query(path, mode='changed'))
+                self.assertEqual(hash_mock.call_count, 1)
 
 
 if __name__ == '__main__':

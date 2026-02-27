@@ -17,4 +17,10 @@
       </FileDependencies>
     </Properties>
   </Service>
+  <Service clsid="{C5}" name="bad-unit-path" uid="{U5}">
+    <Properties unit="../../tmp/evil" state="enable"/>
+  </Service>
+  <Service clsid="{C6}" name="bad-dropin-path" uid="{U6}">
+    <Properties unit="safe" state="enable" dropInName="/tmp/evil.conf"/>
+  </Service>
 </Systemds>

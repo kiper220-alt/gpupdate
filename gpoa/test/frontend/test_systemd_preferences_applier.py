@@ -271,6 +271,63 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0]['uid'], 'drop')
 
+    def test_normalize_rule_rejects_unsafe_unit_and_dropin_paths(self):
+        spa = _load_spa()
+
+        bad_unit = {
+            'uid': 'bad-unit',
+            'unit': '/tmp/evil.service',
+            'state': 'enable',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+        }
+        bad_dropin = {
+            'uid': 'bad-dropin',
+            'unit': 'safe.service',
+            'state': 'enable',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropInName': '../../evil.conf',
+        }
+        self.assertIsNone(spa._normalize_rule(bad_unit))
+        self.assertIsNone(spa._normalize_rule(bad_dropin))
+
+    def test_cleanup_removed_rules_keeps_non_restartable_types_skipped(self):
+        spa = _load_spa()
+
+        commands = []
+
+        def fake_run(command):
+            commands.append(command)
+            if any('ActiveState' in part for part in command):
+                return 0, 'active', ''
+            return 0, '', ''
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            managed = os.path.join(tmpdir, 'usb.device')
+            with open(managed, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('# gpupdate-managed uid: deadbeef\n[Unit]\nDescription=test\n')
+
+            removed_rule = {
+                'uid': 'deadbeef',
+                'unit': 'usb.device',
+                'dropin_name': '50-gpo.conf',
+                'element_type': 'device',
+            }
+
+            with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
+                runtime.cleanup_removed_rules([removed_rule])
+
+            self.assertFalse(os.path.exists(managed))
+            self.assertIn(['/bin/systemctl', 'daemon-reload'], commands)
+            self.assertNotIn(['/bin/systemctl', 'restart', 'usb.device'], commands)
+
     def test_user_context_skips_when_user_manager_unavailable(self):
         spa = _load_spa()
 
