@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
+
 from util.logging import log
 from util.xml import get_xml_root
 
@@ -83,6 +85,25 @@ def _normalize_unit_name(unit_name, element_name):
     return '{}{}'.format(unit_name, suffix)
 
 
+def _is_safe_component(value):
+    text = str(value) if value is not None else ''
+    if not text:
+        return False
+    if text in ('.', '..'):
+        return False
+    if text != text.strip():
+        return False
+    if '/' in text or '\\' in text:
+        return False
+    if os.path.isabs(text):
+        return False
+    if len(text) >= 2 and text[1] == ':' and text[0].isalpha():
+        return False
+    if '\x00' in text:
+        return False
+    return True
+
+
 def _invalid_entry(message, data=None):
     payload = {'reason': message}
     if data:
@@ -125,6 +146,9 @@ def _parse_policy_element(policy_element):
 
     if not unit:
         _invalid_entry('Missing unit attribute', {'element': element_name})
+        return None
+    if not _is_safe_component(unit):
+        _invalid_entry('Invalid unit value', {'element': element_name, 'unit': unit})
         return None
     if state not in VALID_STATES:
         _invalid_entry('Invalid state', {'element': element_name, 'state': state, 'unit': unit})
@@ -176,7 +200,12 @@ def _parse_policy_element(policy_element):
     policy.apply_mode = apply_mode
     policy.policy_target = policy_target
     policy.edit_mode = edit_mode
-    policy.dropin_name = properties.get('dropInName', DEFAULT_DROPIN_NAME)
+    dropin_name = properties.get('dropInName', DEFAULT_DROPIN_NAME) or DEFAULT_DROPIN_NAME
+    if not _is_safe_component(dropin_name):
+        _invalid_entry('Invalid dropInName', {'element': element_name, 'dropInName': dropin_name, 'unit': unit})
+        return None
+
+    policy.dropin_name = dropin_name
     policy.unit_file = unit_file_text
     policy.unit_file_mode = 'text'
     policy.file_dependencies = _parse_file_dependencies(properties)

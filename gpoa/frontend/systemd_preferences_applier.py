@@ -63,6 +63,25 @@ def _as_bool(value):
     return str(value).lower() in ('1', 'true', 'yes')
 
 
+def _is_safe_component(value):
+    text = str(value) if value is not None else ''
+    if not text:
+        return False
+    if text in ('.', '..'):
+        return False
+    if text != text.strip():
+        return False
+    if '/' in text or '\\' in text:
+        return False
+    if os.path.isabs(text):
+        return False
+    if len(text) >= 2 and text[1] == ':' and text[0].isalpha():
+        return False
+    if '\x00' in text:
+        return False
+    return True
+
+
 def _expand_windows_var(path, username=None):
     if not path:
         return path
@@ -116,6 +135,9 @@ def _normalize_rule(item):
 
     if not unit or state not in VALID_STATES:
         return None
+    if not _is_safe_component(unit):
+        log('W47', {'reason': 'Invalid unit value', 'unit': unit})
+        return None
     if apply_mode not in VALID_APPLY_MODES:
         return None
     if policy_target not in VALID_POLICY_TARGETS:
@@ -135,6 +157,11 @@ def _normalize_rule(item):
         and dep.get('path')
     ]
 
+    dropin_name = item.get('dropin_name', item.get('dropInName', DEFAULT_DROPIN_NAME)) or DEFAULT_DROPIN_NAME
+    if not _is_safe_component(dropin_name):
+        log('W47', {'reason': 'Invalid dropInName', 'dropInName': dropin_name, 'unit': unit})
+        return None
+
     return {
         'uid': str(uid),
         'unit': unit,
@@ -143,7 +170,7 @@ def _normalize_rule(item):
         'apply_mode': apply_mode,
         'policy_target': policy_target,
         'edit_mode': edit_mode,
-        'dropin_name': item.get('dropin_name', item.get('dropInName', DEFAULT_DROPIN_NAME)) or DEFAULT_DROPIN_NAME,
+        'dropin_name': dropin_name,
         'unit_file': item.get('unit_file', item.get('unitFile')),
         'file_dependencies': dependencies,
         'element_type': item.get('element_type', item.get('elementType', 'service')),
@@ -312,7 +339,7 @@ class _systemd_preferences_runtime:
                     target.unlink()
                     record_presence_changed(str(target))
                     self.daemon_reload_required = True
-                    affected_units.add(rule['unit'])
+                    affected_units.add((rule['unit'], rule.get('element_type', 'service')))
                 except Exception as exc:
                     _syslog('W', 'Failed to cleanup managed file', {'path': str(target), 'error': str(exc)})
             dropin_dir = dropin_path.parent
@@ -324,10 +351,10 @@ class _systemd_preferences_runtime:
 
         if self.daemon_reload_required:
             self._daemon_reload()
-            for unit_name in affected_units:
+            for unit_name, element_type in affected_units:
                 cleanup_rule = {
                     'unit': unit_name,
-                    'element_type': 'service',
+                    'element_type': element_type,
                 }
                 self._restart(cleanup_rule)
 

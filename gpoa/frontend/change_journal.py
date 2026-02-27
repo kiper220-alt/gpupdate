@@ -22,6 +22,8 @@ import stat
 
 
 _watched_paths = {}
+_current_snapshots = {}
+_current_snapshot_keys = {}
 _changed_paths = set()
 _presence_changed_paths = set()
 
@@ -56,25 +58,30 @@ def _sha256(path_obj):
     return digest.hexdigest()
 
 
-def _snapshot(path):
-    path_obj = Path(path)
-    try:
-        stat_result = path_obj.lstat()
-    except FileNotFoundError:
-        return {
-            'exists': False,
-            'kind': None,
-            'stat': None,
-            'sha256': None,
-        }
-    except Exception:
-        return {
-            'exists': False,
-            'kind': None,
-            'stat': None,
-            'sha256': None,
-        }
+def _present_snapshot_key(stat_result):
+    return (
+        'present',
+        stat_result.st_mode,
+        stat_result.st_uid,
+        stat_result.st_gid,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        stat_result.st_ino,
+    )
 
+
+def _missing_snapshot(snapshot_key):
+    return {
+        'exists': False,
+        'kind': None,
+        'stat': None,
+        'sha256': None,
+        '_snapshot_key': snapshot_key,
+    }
+
+
+def _present_snapshot(path_obj, stat_result, snapshot_key):
     sha256 = None
     if stat.S_ISREG(stat_result.st_mode):
         try:
@@ -91,13 +98,31 @@ def _snapshot(path):
             stat_result.st_gid,
             stat_result.st_size,
             stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+            stat_result.st_ino,
         ),
         'sha256': sha256,
+        '_snapshot_key': snapshot_key,
     }
+
+
+def _snapshot(path):
+    path_obj = Path(path)
+    try:
+        stat_result = path_obj.lstat()
+        snapshot_key = _present_snapshot_key(stat_result)
+    except FileNotFoundError:
+        return _missing_snapshot(('absent',))
+    except Exception:
+        return _missing_snapshot(('error',))
+
+    return _present_snapshot(path_obj, stat_result, snapshot_key)
 
 
 def reset():
     _watched_paths.clear()
+    _current_snapshots.clear()
+    _current_snapshot_keys.clear()
     _changed_paths.clear()
     _presence_changed_paths.clear()
 
@@ -108,6 +133,8 @@ def watch(path):
         return
     if normalized not in _watched_paths:
         _watched_paths[normalized] = _snapshot(normalized)
+    _current_snapshots.pop(normalized, None)
+    _current_snapshot_keys.pop(normalized, None)
 
 
 def watch_many(paths):
@@ -130,11 +157,32 @@ def record_presence_changed(path):
         _changed_paths.add(normalized)
 
 
+def _snapshot_current(path):
+    path_obj = Path(path)
+    try:
+        stat_result = path_obj.lstat()
+        key = _present_snapshot_key(stat_result)
+        snapshot_factory = lambda: _present_snapshot(path_obj, stat_result, key)
+    except FileNotFoundError:
+        key = ('absent',)
+        snapshot_factory = lambda: _missing_snapshot(key)
+    except Exception:
+        key = ('error',)
+        snapshot_factory = lambda: _missing_snapshot(key)
+
+    if _current_snapshot_keys.get(path) == key:
+        return _current_snapshots[path]
+    current = snapshot_factory()
+    _current_snapshot_keys[path] = key
+    _current_snapshots[path] = current
+    return current
+
+
 def _presence_changed(path):
     baseline = _watched_paths.get(path)
     if baseline is None:
         return False
-    current = _snapshot(path)
+    current = _snapshot_current(path)
     return baseline['exists'] != current['exists']
 
 
@@ -142,7 +190,7 @@ def _changed(path):
     baseline = _watched_paths.get(path)
     if baseline is None:
         return False
-    current = _snapshot(path)
+    current = _snapshot_current(path)
 
     if baseline['exists'] != current['exists']:
         return True
