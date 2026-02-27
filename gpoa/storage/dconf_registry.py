@@ -97,6 +97,7 @@ class Dconf_registry():
     environmentvariables = []
     inifiles = []
     services = []
+    systemds = []
     printers = []
     scripts = []
     networkshares = []
@@ -454,6 +455,11 @@ class Dconf_registry():
         networkshareobj.policy_name = policy_name
         cls.networkshares.append(networkshareobj)
 
+    @classmethod
+    def add_systemd(cls, systemdobj, policy_name):
+        systemdobj.policy_name = policy_name
+        cls.systemds.append(systemdobj)
+
 
     @classmethod
     def get_shortcuts(cls):
@@ -502,6 +508,10 @@ class Dconf_registry():
     @classmethod
     def get_networkshare(cls):
         return cls.networkshares
+
+    @classmethod
+    def get_systemds(cls):
+        return cls.systemds
 
 
     @classmethod
@@ -838,6 +848,7 @@ def add_preferences_to_global_registry_dict(username, is_machine):
                             ('Environmentvariables',remove_duplicate_dicts_in_list(Dconf_registry.environmentvariables)),
                             ('Inifiles',remove_duplicate_dicts_in_list(Dconf_registry.inifiles)),
                             ('Services',remove_duplicate_dicts_in_list(Dconf_registry.services)),
+                            ('Systemds',remove_duplicate_dicts_in_list(Dconf_registry.systemds)),
                             ('Printers',remove_duplicate_dicts_in_list(Dconf_registry.printers)),
                             ('Scripts',remove_duplicate_dicts_in_list(Dconf_registry.scripts)),
                             ('Networkshares',remove_duplicate_dicts_in_list(Dconf_registry.networkshares))]
