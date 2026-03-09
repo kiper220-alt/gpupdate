@@ -35,7 +35,6 @@ class _storage_stub:
     def get_key_value(self, path):
         return None
 
-
 def _load_spa():
     if 'frontend' not in sys.modules:
         frontend_pkg = types.ModuleType('frontend')

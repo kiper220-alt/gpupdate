@@ -54,7 +54,7 @@ class FileType(Enum):
     ENVIRONMENTVARIABLES = 'environmentvariables.xml'
     INIFILES = 'inifiles.xml'
     SERVICES = 'services.xml'
-    SYSTEMDS = 'systemds.xml'
+    SYSTEMDS = 'systemd.xml'
     PRINTERS = 'printers.xml'
     SCRIPTS = 'scripts.ini'
     NETWORKSHARES = 'networkshares.xml'
@@ -143,7 +143,7 @@ class gpt:
             , 'files'
             , 'inifiles'
             , 'services'
-            , 'systemds'
+            , 'systemd'
             , 'scheduledtasks'
             , 'scripts'
             , 'networkshares'
@@ -290,13 +290,13 @@ def find_preffile(search_path, prefname):
     if not prefdir:
         return None
 
-    # Then search for preference directory
     pref_dir = find_dir(prefdir, prefname)
-    file_name = '{}.xml'.format(prefname)
-    # And then try to find the corresponding file.
-    pref_file = find_file(pref_dir, file_name)
+    if pref_dir:
+        pref_file = find_file(pref_dir, '{}.xml'.format(prefname))
+        if pref_file:
+            return pref_file
 
-    return pref_file
+    return None
 
 def lp2gpt():
     '''

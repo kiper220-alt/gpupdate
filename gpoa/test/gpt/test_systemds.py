@@ -17,8 +17,13 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import tempfile
 import unittest
 import unittest.mock
+import ast
+import types
+from enum import Enum, unique
+from pathlib import Path
 
 
 class _storage_stub:
@@ -28,6 +33,38 @@ class _storage_stub:
     def add_systemd(self, item, policy_name):
         item.policy_name = policy_name
         self.items.append(item)
+
+def _load_gpt_discovery_helpers():
+    source_path = os.path.join(os.getcwd(), 'gpt', 'gpt.py')
+    with open(source_path, 'r', encoding='utf-8') as file_obj:
+        tree = ast.parse(file_obj.read(), filename=source_path)
+
+    needed_names = {
+        'FileType',
+        'get_preftype',
+        'find_dir',
+        'find_file',
+        'find_preferences',
+        'find_preffile',
+    }
+    selected_nodes = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in needed_names:
+            selected_nodes.append(node)
+        elif isinstance(node, ast.Assign):
+            targets = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            if any(name in needed_names for name in targets):
+                selected_nodes.append(node)
+
+    module = ast.Module(body=selected_nodes, type_ignores=[])
+    namespace = {
+        'Enum': Enum,
+        'unique': unique,
+        'os': os,
+        'Path': Path,
+    }
+    exec(compile(module, source_path, 'exec'), namespace)
+    return types.SimpleNamespace(**namespace)
 
 
 class GptSystemdsTestCase(unittest.TestCase):
@@ -86,6 +123,31 @@ class GptSystemdsTestCase(unittest.TestCase):
         gpt.systemds.merge_systemds(storage, items, 'policy-test')
         self.assertEqual(len(storage.items), len(items))
         self.assertEqual(storage.items[0].policy_name, 'policy-test')
+
+    def test_gpt_discovery_supports_windows_systemd_layout(self):
+        gpt_helpers = _load_gpt_discovery_helpers()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            machine_dir = os.path.join(tmpdir, 'MACHINE')
+            valid_dir = os.path.join(machine_dir, 'PREFERENCES', 'SYSTEMD')
+            os.makedirs(valid_dir, exist_ok=True)
+            valid_file = os.path.join(valid_dir, 'SYSTEMD.XML')
+            with open(valid_file, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('<?xml version="1.0" encoding="UTF-8"?><Systemds clsid="{ROOT}"/>')
+
+            invalid_paths = [
+                os.path.join(machine_dir, 'PREFERENCES', 'SYSTEMDS', 'SYSTEMDS.XML'),
+                os.path.join(machine_dir, 'PREFERENCES', 'SYSTEMDS', 'SYSTEMD.XML'),
+                os.path.join(machine_dir, 'PREFERENCES', 'SYSTEMD', 'SYSTEMDS.XML'),
+            ]
+            for path in invalid_paths:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w', encoding='utf-8') as file_obj:
+                    file_obj.write('<?xml version="1.0" encoding="UTF-8"?><Systemds clsid="{ROOT}"/>')
+
+            found = gpt_helpers.find_preffile(machine_dir, 'systemd')
+            self.assertEqual(found, valid_file)
+            self.assertEqual(gpt_helpers.get_preftype(valid_file), gpt_helpers.FileType.SYSTEMDS)
 
 
 if __name__ == '__main__':
