@@ -831,8 +831,18 @@ def get_dconf_envprofile():
 def convert_elements_to_list_dicts(elements):
     return list(map(lambda x: dict(x), elements))
 
+def _freeze_for_dedup(value):
+    if isinstance(value, dict):
+        return tuple((key, _freeze_for_dedup(val)) for key, val in sorted(value.items()))
+    if isinstance(value, list):
+        return tuple(_freeze_for_dedup(item) for item in value)
+    return value
+
 def remove_duplicate_dicts_in_list(list_dict):
-    return convert_elements_to_list_dicts(list(OrderedDict((tuple(sorted(d.items())), d) for d in list_dict).values()))
+    result = OrderedDict()
+    for item in convert_elements_to_list_dicts(list_dict):
+        result.setdefault(_freeze_for_dedup(item), item)
+    return list(result.values())
 
 def add_preferences_to_global_registry_dict(username, is_machine):
     if is_machine:

@@ -64,6 +64,39 @@ class SystemdsStorageTestCase(unittest.TestCase):
         self.assertIn('sshd.service', data)
         self.assertIn('uid-1', data)
 
+    def test_remove_duplicates_supports_nested_lists(self):
+        item = systemd_policy('nginx.service')
+        item.uid = 'uid-2'
+        item.clsid = 'clsid-2'
+        item.name = 'nginx'
+        item.state = 'enable'
+        item.policy_target = 'machine'
+        item.apply_mode = 'if_exists'
+        item.edit_mode = 'override'
+        item.dropin_name = '50-gpo.conf'
+        item.file_dependencies = [{'mode': 'changed', 'path': '/etc/nginx/nginx.conf'}]
+
+        duplicate = systemd_policy('nginx.service')
+        duplicate.uid = 'uid-2'
+        duplicate.clsid = 'clsid-2'
+        duplicate.name = 'nginx'
+        duplicate.state = 'enable'
+        duplicate.policy_target = 'machine'
+        duplicate.apply_mode = 'if_exists'
+        duplicate.edit_mode = 'override'
+        duplicate.dropin_name = '50-gpo.conf'
+        duplicate.file_dependencies = [{'mode': 'changed', 'path': '/etc/nginx/nginx.conf'}]
+
+        self.Dconf_registry.add_systemd(item, 'Policy')
+        self.Dconf_registry.add_systemd(duplicate, 'Policy')
+
+        self.add_preferences_to_global_registry_dict('Machine', True)
+
+        prefix = 'Software/BaseALT/Policies/Preferences/Machine'
+        data = self.Dconf_registry.global_registry_dict[prefix]['Systemds']
+        self.assertIn('nginx.service', data)
+        self.assertEqual(data.count('uid-2'), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
