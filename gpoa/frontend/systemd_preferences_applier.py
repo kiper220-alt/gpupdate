@@ -20,12 +20,19 @@ import base64
 import binascii
 import os
 from pathlib import Path
-import subprocess
+import re
+import stat
+import tempfile
 
 from util.logging import log
 from util.util import get_homedir, get_uid_by_username, string_to_literal_eval
 
 from .applier_frontend import applier_frontend, check_enabled
+from .appliers.systemd import (
+    SystemdManager,
+    SystemdManagerError,
+    is_valid_unit_name,
+)
 from .change_journal import query, record_changed, record_presence_changed, watch_many
 
 
@@ -37,6 +44,11 @@ VALID_POLICY_TARGETS = {'machine', 'user'}
 VALID_EDIT_MODES = {'create', 'override', 'create_or_override'}
 VALID_DEP_MODES = {'changed', 'presence_changed'}
 NON_RESTARTABLE_TYPES = {'device', 'scope'}
+DROPIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@-]{1,128}\.conf$')
+MAX_RULES_PER_SCOPE = 512
+MAX_DEPENDENCIES_PER_RULE = 32
+MAX_DEPENDENCY_PATH_LEN = 4096
+MAX_UNIT_FILE_SIZE = 128 * 1024
 
 
 class _Context:
@@ -44,9 +56,7 @@ class _Context:
         self.mode = mode
         self.username = username
         self.systemd_dir = '/etc/systemd/system'
-        self.systemctl_base = ['/bin/systemctl']
         if mode == 'user':
-            self.systemctl_base = ['/bin/systemctl', '--user']
             self.systemd_dir = os.path.join(get_homedir(username), '.config/systemd/user')
 
 
@@ -65,23 +75,20 @@ def _as_bool(value):
     return str(value).lower() in ('1', 'true', 'yes')
 
 
-def _is_safe_component(value):
-    text = str(value) if value is not None else ''
-    if not text:
+def _has_control_chars(value):
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in str(value))
+
+
+def _is_valid_dropin_name(value):
+    if not isinstance(value, str):
         return False
-    if text in ('.', '..'):
+    if not value or value != value.strip():
         return False
-    if text != text.strip():
+    if '\x00' in value or '/' in value or '\\' in value:
         return False
-    if '/' in text or '\\' in text:
+    if _has_control_chars(value):
         return False
-    if os.path.isabs(text):
-        return False
-    if len(text) >= 2 and text[1] == ':' and text[0].isalpha():
-        return False
-    if '\x00' in text:
-        return False
-    return True
+    return bool(DROPIN_NAME_RE.match(value))
 
 
 def _expand_windows_var(path, username=None):
@@ -107,11 +114,6 @@ def _expand_windows_var(path, username=None):
     return result
 
 
-def _run_command(command):
-    process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    return process.returncode, process.stdout.strip(), process.stderr.strip()
-
-
 def _read_preferences(storage, scope_name, is_previous=False):
     prefix = 'Software/BaseALT/Policies/Preferences/{}'.format(scope_name)
     if is_previous:
@@ -124,7 +126,38 @@ def _read_preferences(storage, scope_name, is_previous=False):
     items = string_to_literal_eval(value)
     if not isinstance(items, list):
         return []
-    return [item for item in items if isinstance(item, dict)]
+    entries = [item for item in items if isinstance(item, dict)]
+    if len(entries) > MAX_RULES_PER_SCOPE:
+        log('W47', {
+            'reason': 'Systemd preferences rule limit exceeded',
+            'scope': scope_name,
+            'count': len(entries),
+            'limit': MAX_RULES_PER_SCOPE,
+        })
+        return entries[:MAX_RULES_PER_SCOPE]
+    return entries
+
+
+def _is_valid_dependency_path(path, policy_target):
+    if not isinstance(path, str):
+        return False
+    if not path or len(path) > MAX_DEPENDENCY_PATH_LEN:
+        return False
+    if '\x00' in path or _has_control_chars(path):
+        return False
+
+    expanded = _expand_windows_var(path)
+    if not expanded or len(expanded) > MAX_DEPENDENCY_PATH_LEN:
+        return False
+    if '\x00' in expanded or _has_control_chars(expanded):
+        return False
+
+    upper_path = path.upper()
+    if policy_target == 'user':
+        if '%HOME%' in upper_path or '%HOMEPATH%' in upper_path:
+            return os.path.isabs(expanded)
+        return os.path.isabs(path) and os.path.isabs(expanded)
+    return os.path.isabs(expanded)
 
 
 def _normalize_rule(item):
@@ -137,7 +170,7 @@ def _normalize_rule(item):
 
     if not unit or state not in VALID_STATES:
         return None
-    if not _is_safe_component(unit):
+    if not is_valid_unit_name(str(unit)):
         log('W47', {'reason': 'Invalid unit value', 'unit': unit})
         return None
     if apply_mode not in VALID_APPLY_MODES:
@@ -152,33 +185,59 @@ def _normalize_rule(item):
     dependencies = item.get('file_dependencies', item.get('fileDependencies', []))
     if not isinstance(dependencies, list):
         dependencies = []
-    dependencies = [
-        dep for dep in dependencies
-        if isinstance(dep, dict)
-        and dep.get('mode') in VALID_DEP_MODES
-        and dep.get('path')
-    ]
+    if len(dependencies) > MAX_DEPENDENCIES_PER_RULE:
+        log('W47', {
+            'reason': 'Too many file dependencies',
+            'unit': unit,
+            'count': len(dependencies),
+            'limit': MAX_DEPENDENCIES_PER_RULE,
+        })
+        return None
+
+    valid_dependencies = []
+    for dep in dependencies:
+        if not isinstance(dep, dict):
+            continue
+        mode = dep.get('mode')
+        path = dep.get('path')
+        if mode not in VALID_DEP_MODES or not path:
+            continue
+        if not _is_valid_dependency_path(str(path), policy_target):
+            log('W47', {
+                'reason': 'Invalid dependency path',
+                'unit': unit,
+                'path': str(path),
+                'policy_target': policy_target,
+            })
+            continue
+        valid_dependencies.append({'mode': mode, 'path': str(path)})
 
     dropin_name = item.get('dropin_name', item.get('dropInName', DEFAULT_DROPIN_NAME)) or DEFAULT_DROPIN_NAME
-    if not _is_safe_component(dropin_name):
+    if not _is_valid_dropin_name(str(dropin_name)):
         log('W47', {'reason': 'Invalid dropInName', 'dropInName': dropin_name, 'unit': unit})
         return None
 
     unit_file = _decode_unit_file_b64(item, unit, uid)
     if unit_file is None:
         unit_file = _normalize_unit_file_content(item.get('unit_file', item.get('unitFile')))
+    if unit_file is None and (item.get('unit_file') is not None or item.get('unitFile') is not None):
+        log('W47', {
+            'reason': 'Invalid unit_file payload',
+            'unit': unit,
+            'uid': str(uid),
+        })
 
     return {
         'uid': str(uid),
-        'unit': unit,
+        'unit': str(unit),
         'state': state,
         'now': _as_bool(item.get('now', False)),
         'apply_mode': apply_mode,
         'policy_target': policy_target,
         'edit_mode': edit_mode,
-        'dropin_name': dropin_name,
+        'dropin_name': str(dropin_name),
         'unit_file': unit_file,
-        'file_dependencies': dependencies,
+        'file_dependencies': valid_dependencies,
         'element_type': item.get('element_type', item.get('elementType', 'service')),
     }
 
@@ -195,11 +254,88 @@ def _rule_matches_apply_mode(rule, exists):
 def _is_managed_by_uid(path, uid):
     if not path.exists() or not path.is_file():
         return False
-    try:
-        content = path.read_text(encoding='utf-8')
-    except Exception:
+    content = _safe_read_text(path)
+    if content is None:
         return False
-    return MANAGED_HEADER.format(uid) in content
+    first_line = content.splitlines()[0] if content else ''
+    return first_line == MANAGED_HEADER.format(uid)
+
+
+def _validate_existing_file(path):
+    fd = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(path), flags)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, False
+        if st.st_nlink > 1:
+            return None, False
+        with os.fdopen(fd, 'r', encoding='utf-8') as file_obj:
+            content = file_obj.read()
+            fd = None
+            return content, True
+    except (OSError, UnicodeDecodeError):
+        return None, False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _safe_read_text(path):
+    content, ok = _validate_existing_file(path)
+    if not ok:
+        return None
+    return content
+
+
+def _safe_write_text(path, content):
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        return False, False
+
+    existed = path.exists()
+    if existed:
+        _, ok = _validate_existing_file(path)
+        if not ok:
+            return False, existed
+
+    data = content.encode('utf-8')
+    tmp_fd = None
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix='.gpupdate-', dir=str(parent))
+        os.fchmod(tmp_fd, 0o644)
+        os.write(tmp_fd, data)
+        os.fsync(tmp_fd)
+        os.close(tmp_fd)
+        tmp_fd = None
+        os.replace(tmp_path, str(path))
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return True, existed
+    except OSError:
+        return False, existed
+    finally:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _normalize_unit_file_content(unit_file):
@@ -209,10 +345,15 @@ def _normalize_unit_file_content(unit_file):
     text = str(unit_file)
     # Keep already multiline text as-is; only unescape policy-encoded newlines.
     if '\n' in text or '\r' in text:
-        return text.replace('\r\n', '\n').replace('\r', '\n')
-    if '\\n' in text or '\\r' in text:
-        text = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\r', '\n')
-    return text
+        normalized = text.replace('\r\n', '\n').replace('\r', '\n')
+    elif '\\n' in text or '\\r' in text:
+        normalized = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\r', '\n')
+    else:
+        normalized = text
+
+    if len(normalized.encode('utf-8')) > MAX_UNIT_FILE_SIZE:
+        return None
+    return normalized
 
 
 def _decode_unit_file_b64(item, unit, uid):
@@ -222,6 +363,14 @@ def _decode_unit_file_b64(item, unit, uid):
 
     try:
         data = base64.b64decode(str(payload), validate=True)
+        if len(data) > MAX_UNIT_FILE_SIZE:
+            log('W47', {
+                'reason': 'unit_file_b64 exceeds size limit',
+                'unit': unit,
+                'uid': uid,
+                'limit': MAX_UNIT_FILE_SIZE,
+            })
+            return None
         return data.decode('utf-8')
     except (TypeError, ValueError, binascii.Error, UnicodeDecodeError):
         log('W47', {
@@ -233,37 +382,44 @@ def _decode_unit_file_b64(item, unit, uid):
 
 
 class _systemd_preferences_runtime:
-    def __init__(self, storage, scope_name, context):
+    def __init__(self, storage, scope_name, context, systemd_manager=None):
         self.storage = storage
         self.scope_name = scope_name
         self.context = context
+        self.systemd_manager = systemd_manager
         self.daemon_reload_required = False
         self.phase2_candidates = []
 
-    def _systemctl(self, *args):
-        command = self.context.systemctl_base + list(args)
-        return _run_command(command)
+    def _manager(self):
+        if self.systemd_manager is None:
+            try:
+                self.systemd_manager = SystemdManager(mode=self.context.mode)
+            except Exception as exc:
+                raise SystemdManagerError(str(exc), action='connect')
+        return self.systemd_manager
 
     def _exists(self, unit_name):
-        rc, stdout, _ = self._systemctl('show', '--property=LoadState', '--value', unit_name)
-        if rc != 0:
+        try:
+            return self._manager().exists(unit_name)
+        except SystemdManagerError as exc:
+            _syslog('W', 'Unable to query unit existence', {'unit': unit_name, 'error': str(exc)})
             return False
-        load_state = stdout.strip()
-        return load_state not in ('not-found', 'error', '')
 
     def _daemon_reload(self):
         log('D245', {'context': self.context.mode})
-        rc, _, err = self._systemctl('daemon-reload')
-        if rc != 0:
-            log('W50', {'context': self.context.mode, 'error': err})
-            _syslog('W', 'daemon-reload failed', {'context': self.context.mode, 'error': err})
+        try:
+            self._manager().reload()
+        except SystemdManagerError as exc:
+            error = str(exc)
+            log('W50', {'context': self.context.mode, 'error': error})
+            _syslog('W', 'daemon-reload failed', {'context': self.context.mode, 'error': error})
         self.daemon_reload_required = False
 
     def _active_state(self, unit_name):
-        rc, stdout, _ = self._systemctl('show', '--property=ActiveState', '--value', unit_name)
-        if rc != 0:
+        try:
+            return self._manager().active_state(unit_name)
+        except SystemdManagerError:
             return None
-        return stdout.strip()
 
     def _restart(self, rule):
         if rule.get('element_type') in NON_RESTARTABLE_TYPES:
@@ -275,9 +431,10 @@ class _systemd_preferences_runtime:
         if state not in ('active', 'activating'):
             return
 
-        rc, _, err = self._systemctl('restart', rule['unit'])
-        if rc != 0:
-            _syslog('W', 'Restart failed', {'unit': rule['unit'], 'error': err})
+        try:
+            self._manager().restart(rule['unit'])
+        except SystemdManagerError as exc:
+            _syslog('W', 'Restart failed', {'unit': rule['unit'], 'error': str(exc)})
 
     def _rule_managed_paths(self, rule):
         unit_file_path = Path(self.context.systemd_dir).joinpath(rule['unit'])
@@ -286,21 +443,21 @@ class _systemd_preferences_runtime:
         return unit_file_path, dropin_path
 
     def _write_rule_file(self, target_file, uid, unit_file):
-        target_file.parent.mkdir(parents=True, exist_ok=True)
         marker = MANAGED_HEADER.format(uid)
         body = unit_file if unit_file.endswith('\n') else '{}\n'.format(unit_file)
         content = '{}\n{}'.format(marker, body)
-        if target_file.exists():
-            try:
-                old_content = target_file.read_text(encoding='utf-8')
-            except Exception:
-                old_content = None
-            if old_content == content:
-                return
-            target_file.write_text(content, encoding='utf-8')
+        old_content = _safe_read_text(target_file) if target_file.exists() else None
+        if old_content == content:
+            return
+
+        written, existed = _safe_write_text(target_file, content)
+        if not written:
+            _syslog('W', 'Unable to safely write managed file', {'path': str(target_file)})
+            return
+
+        if existed:
             record_changed(str(target_file))
         else:
-            target_file.write_text(content, encoding='utf-8')
             record_presence_changed(str(target_file))
         self.daemon_reload_required = True
 
@@ -327,28 +484,10 @@ class _systemd_preferences_runtime:
         if state == 'as_is':
             return
 
-        action = state
-        command = [action]
-        if rule['now']:
-            command.append('--now')
-        command.append(rule['unit'])
-        rc, _, err = self._systemctl(*command)
-        if rc == 0:
-            return
-
-        if not rule['now']:
-            _syslog('W', 'State apply failed', {'unit': rule['unit'], 'state': state, 'error': err})
-            return
-
-        # Fallback behavior for systemd variants lacking --now support.
-        fallback = [action, rule['unit']]
-        rc, _, err = self._systemctl(*fallback)
-        if rc != 0:
-            _syslog('W', 'State apply failed', {'unit': rule['unit'], 'state': state, 'error': err})
-            return
-
-        runtime_action = 'start' if state in ('enable', 'unmask', 'preset') else 'stop'
-        self._systemctl(runtime_action, rule['unit'])
+        try:
+            self._manager().apply_state(rule['unit'], state, rule['now'])
+        except (SystemdManagerError, ValueError) as exc:
+            _syslog('W', 'State apply failed', {'unit': rule['unit'], 'state': state, 'error': str(exc)})
 
     def apply_rules(self, rules):
         for rule in rules:
@@ -396,6 +535,8 @@ class _systemd_preferences_runtime:
 
     def _dependency_changed(self, dependency, username=None):
         dep_path = _expand_windows_var(dependency['path'], username)
+        if not dep_path or not os.path.isabs(dep_path):
+            return False
         mode = dependency['mode']
         return query(dep_path, mode=mode)
 
@@ -444,7 +585,7 @@ def _collect_dependency_paths(storage, scope_name, target, username=None):
     for rule in _get_rules_for_scope(storage, scope_name, target):
         for dependency in rule.get('file_dependencies', []):
             dep_path = _expand_windows_var(dependency.get('path'), username)
-            if dep_path:
+            if dep_path and os.path.isabs(dep_path):
                 dependency_paths.append(dep_path)
     return dependency_paths
 
