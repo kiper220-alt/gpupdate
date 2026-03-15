@@ -18,9 +18,10 @@
 
 import base64
 import os
+import re
+from xml.etree import ElementTree
 
 from util.logging import log
-from util.xml import get_xml_root
 
 from .dynamic_attributes import DynamicAttributes
 
@@ -45,6 +46,13 @@ VALID_POLICY_TARGETS = {'machine', 'user'}
 VALID_EDIT_MODES = {'create', 'override', 'create_or_override'}
 VALID_DEP_MODES = {'changed', 'presence_changed'}
 DEFAULT_DROPIN_NAME = '50-gpo.conf'
+DROPIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@-]{1,128}\.conf$')
+UNIT_NAME_RE = re.compile(
+    r'^[A-Za-z0-9:_.@-]{1,255}\.(service|socket|timer|path|mount|automount|swap|target|device|slice|scope)$'
+)
+MAX_DEPENDENCIES_PER_RULE = 32
+MAX_DEPENDENCY_PATH_LEN = 4096
+MAX_UNIT_FILE_SIZE = 128 * 1024
 
 UNIT_SUFFIX = {
     'Service': '.service',
@@ -105,6 +113,79 @@ def _is_safe_component(value):
     return True
 
 
+def _has_control_chars(value):
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in str(value))
+
+
+def _is_valid_unit_name(value):
+    if not _is_safe_component(value):
+        return False
+    if _has_control_chars(value):
+        return False
+    return bool(UNIT_NAME_RE.match(str(value)))
+
+
+def _is_valid_dropin_name(value):
+    if not _is_safe_component(value):
+        return False
+    if _has_control_chars(value):
+        return False
+    return bool(DROPIN_NAME_RE.match(str(value)))
+
+
+def _expand_windows_var(path):
+    if not path:
+        return path
+    variables = {
+        'HOME': '/etc/skel',
+        'HOMEPATH': '/etc/skel',
+        'HOMEDRIVE': '/',
+        'SystemRoot': '/',
+        'SystemDrive': '/',
+        'USERNAME': '',
+    }
+    result = str(path)
+    for key, value in variables.items():
+        replacement = str(value)
+        if key not in ('USERNAME',) and not replacement.endswith('/'):
+            replacement = '{}{}'.format(replacement, '/')
+        result = result.replace('%{}%'.format(key), replacement)
+    return result
+
+
+def _is_valid_dependency_path(path, policy_target):
+    if not isinstance(path, str):
+        return False
+    if not path or len(path) > MAX_DEPENDENCY_PATH_LEN:
+        return False
+    if '\x00' in path or _has_control_chars(path):
+        return False
+
+    expanded = _expand_windows_var(path)
+    if not expanded or len(expanded) > MAX_DEPENDENCY_PATH_LEN:
+        return False
+    if '\x00' in expanded or _has_control_chars(expanded):
+        return False
+
+    upper_path = path.upper()
+    if policy_target == 'user':
+        if '%HOME%' in upper_path or '%HOMEPATH%' in upper_path:
+            return os.path.isabs(expanded)
+        return os.path.isabs(path) and os.path.isabs(expanded)
+
+    return os.path.isabs(expanded)
+
+
+def _get_systemds_root(systemds_file):
+    try:
+        from defusedxml import ElementTree as DefusedElementTree
+        xml_contents = DefusedElementTree.parse(systemds_file)
+    except ImportError:
+        log('W47', {'reason': 'defusedxml is unavailable, using xml.etree fallback'})
+        xml_contents = ElementTree.parse(systemds_file)
+    return xml_contents.getroot()
+
+
 def _invalid_entry(message, data=None):
     payload = {'reason': message}
     if data:
@@ -112,17 +193,34 @@ def _invalid_entry(message, data=None):
     log('W47', payload)
 
 
-def _parse_file_dependencies(properties):
+def _parse_file_dependencies(properties, policy_target, unit):
     file_dependencies = []
     dependencies = properties.find('FileDependencies')
     if dependencies is None:
         return file_dependencies
 
-    for dependency in dependencies.findall('Dependency'):
+    dependency_items = list(dependencies.findall('Dependency'))
+    if len(dependency_items) > MAX_DEPENDENCIES_PER_RULE:
+        _invalid_entry('Too many dependency entries', {
+            'unit': unit,
+            'count': len(dependency_items),
+            'limit': MAX_DEPENDENCIES_PER_RULE,
+        })
+        return file_dependencies
+
+    for dependency in dependency_items:
         mode = dependency.get('mode')
         path = dependency.get('path')
         if mode not in VALID_DEP_MODES or not path:
             _invalid_entry('Invalid dependency entry', {'mode': mode, 'path': path})
+            continue
+        if not _is_valid_dependency_path(str(path), policy_target):
+            _invalid_entry('Invalid dependency path', {
+                'mode': mode,
+                'path': path,
+                'policy_target': policy_target,
+                'unit': unit,
+            })
             continue
         file_dependencies.append({'mode': mode, 'path': path})
 
@@ -148,7 +246,7 @@ def _parse_policy_element(policy_element):
     if not unit:
         _invalid_entry('Missing unit attribute', {'element': element_name})
         return None
-    if not _is_safe_component(unit):
+    if not _is_valid_unit_name(unit):
         _invalid_entry('Invalid unit value', {'element': element_name, 'unit': unit})
         return None
     if state not in VALID_STATES:
@@ -183,6 +281,13 @@ def _parse_policy_element(policy_element):
     if unit_file is not None and unit_file.text is not None:
         # UnitFile mode=table is treated as plain text by design.
         unit_file_text = str(unit_file.text)
+        if len(unit_file_text.encode('utf-8')) > MAX_UNIT_FILE_SIZE:
+            _invalid_entry('UnitFile exceeds size limit', {
+                'element': element_name,
+                'unit': unit,
+                'limit': MAX_UNIT_FILE_SIZE,
+            })
+            return None
         unit_file_b64 = base64.b64encode(unit_file_text.encode('utf-8')).decode('ascii')
 
     policy = systemd_policy(unit)
@@ -204,7 +309,7 @@ def _parse_policy_element(policy_element):
     policy.policy_target = policy_target
     policy.edit_mode = edit_mode
     dropin_name = properties.get('dropInName', DEFAULT_DROPIN_NAME) or DEFAULT_DROPIN_NAME
-    if not _is_safe_component(dropin_name):
+    if not _is_valid_dropin_name(dropin_name):
         _invalid_entry('Invalid dropInName', {'element': element_name, 'dropInName': dropin_name, 'unit': unit})
         return None
 
@@ -212,7 +317,7 @@ def _parse_policy_element(policy_element):
     policy.unit_file = unit_file_text
     policy.unit_file_b64 = unit_file_b64
     policy.unit_file_mode = 'text'
-    policy.file_dependencies = _parse_file_dependencies(properties)
+    policy.file_dependencies = _parse_file_dependencies(properties, policy_target, unit)
 
     return policy
 
@@ -222,7 +327,7 @@ def read_systemds(systemds_file):
     Read Systemds.xml from GPT.
     """
     policies = []
-    root = get_xml_root(systemds_file)
+    root = _get_systemds_root(systemds_file)
     if _tag_name(root) != 'Systemds':
         _invalid_entry('Unexpected root element in Systemds.xml', {'root': _tag_name(root)})
         return policies
