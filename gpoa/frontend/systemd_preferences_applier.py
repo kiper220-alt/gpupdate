@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import base64
+import binascii
 import os
 from pathlib import Path
 import subprocess
@@ -162,6 +164,10 @@ def _normalize_rule(item):
         log('W47', {'reason': 'Invalid dropInName', 'dropInName': dropin_name, 'unit': unit})
         return None
 
+    unit_file = _decode_unit_file_b64(item, unit, uid)
+    if unit_file is None:
+        unit_file = _normalize_unit_file_content(item.get('unit_file', item.get('unitFile')))
+
     return {
         'uid': str(uid),
         'unit': unit,
@@ -171,7 +177,7 @@ def _normalize_rule(item):
         'policy_target': policy_target,
         'edit_mode': edit_mode,
         'dropin_name': dropin_name,
-        'unit_file': item.get('unit_file', item.get('unitFile')),
+        'unit_file': unit_file,
         'file_dependencies': dependencies,
         'element_type': item.get('element_type', item.get('elementType', 'service')),
     }
@@ -194,6 +200,36 @@ def _is_managed_by_uid(path, uid):
     except Exception:
         return False
     return MANAGED_HEADER.format(uid) in content
+
+
+def _normalize_unit_file_content(unit_file):
+    if unit_file is None:
+        return None
+
+    text = str(unit_file)
+    # Keep already multiline text as-is; only unescape policy-encoded newlines.
+    if '\n' in text or '\r' in text:
+        return text.replace('\r\n', '\n').replace('\r', '\n')
+    if '\\n' in text or '\\r' in text:
+        text = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\r', '\n')
+    return text
+
+
+def _decode_unit_file_b64(item, unit, uid):
+    payload = item.get('unit_file_b64', item.get('unitFileB64'))
+    if payload is None:
+        return None
+
+    try:
+        data = base64.b64decode(str(payload), validate=True)
+        return data.decode('utf-8')
+    except (TypeError, ValueError, binascii.Error, UnicodeDecodeError):
+        log('W47', {
+            'reason': 'Invalid unit_file_b64 payload',
+            'unit': unit,
+            'uid': uid,
+        })
+        return None
 
 
 class _systemd_preferences_runtime:

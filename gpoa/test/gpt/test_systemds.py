@@ -21,6 +21,7 @@ import tempfile
 import unittest
 import unittest.mock
 import ast
+import base64
 import types
 from enum import Enum, unique
 from pathlib import Path
@@ -83,6 +84,10 @@ class GptSystemdsTestCase(unittest.TestCase):
         self.assertEqual(items[0].edit_mode, 'override')
         self.assertEqual(items[0].dropin_name, 'override.conf')
         self.assertEqual(items[0].unit_file_mode, 'text')
+        self.assertEqual(
+            base64.b64decode(items[0].unit_file_b64.encode('ascii')).decode('utf-8'),
+            items[0].unit_file,
+        )
         self.assertEqual(len(items[0].file_dependencies), 2)
 
         # Ensure automatic suffix mapping works for all supported tags.
@@ -123,6 +128,33 @@ class GptSystemdsTestCase(unittest.TestCase):
         gpt.systemds.merge_systemds(storage, items, 'policy-test')
         self.assertEqual(len(storage.items), len(items))
         self.assertEqual(storage.items[0].policy_name, 'policy-test')
+
+    def test_read_systemds_preserves_quotes_via_unit_file_b64(self):
+        import gpt.systemds
+
+        unit_file_text = "[Service]\nExecStart=/bin/bash -c \"echo 'ok'\"\n"
+        xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<Systemds clsid="{{ROOT}}" disabled="0">
+  <Service clsid="{{C1}}" name="quoted" uid="{{U1}}">
+    <Properties unit="quoted" state="as_is">
+      <UnitFile mode="text">{}</UnitFile>
+    </Properties>
+  </Service>
+</Systemds>
+""".format(unit_file_text)
+
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.xml', delete=False) as file_obj:
+            file_obj.write(xml_content)
+            tmp_path = file_obj.name
+
+        try:
+            items = gpt.systemds.read_systemds(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertEqual(len(items), 1)
+        restored = base64.b64decode(items[0].unit_file_b64.encode('ascii')).decode('utf-8')
+        self.assertEqual(restored, unit_file_text)
 
     def test_gpt_discovery_supports_windows_systemd_layout(self):
         gpt_helpers = _load_gpt_discovery_helpers()

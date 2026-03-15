@@ -17,6 +17,8 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import unittest
+import ast
+import base64
 
 from gpt.systemds import systemd_policy
 
@@ -96,6 +98,31 @@ class SystemdsStorageTestCase(unittest.TestCase):
         data = self.Dconf_registry.global_registry_dict[prefix]['Systemds']
         self.assertIn('nginx.service', data)
         self.assertEqual(data.count('uid-2'), 1)
+
+    def test_serialize_preserves_unit_file_b64_payload(self):
+        unit_file_text = "[Service]\nExecStart=/bin/bash -c \"echo 'ok'\"\n"
+        item = systemd_policy('quoted.service')
+        item.uid = 'uid-3'
+        item.clsid = 'clsid-3'
+        item.name = 'quoted'
+        item.state = 'as_is'
+        item.policy_target = 'machine'
+        item.apply_mode = 'always'
+        item.edit_mode = 'override'
+        item.dropin_name = '50-gpo.conf'
+        item.file_dependencies = []
+        item.unit_file_b64 = base64.b64encode(unit_file_text.encode('utf-8')).decode('ascii')
+
+        self.Dconf_registry.add_systemd(item, 'Policy')
+        self.add_preferences_to_global_registry_dict('Machine', True)
+
+        prefix = 'Software/BaseALT/Policies/Preferences/Machine'
+        data = self.Dconf_registry.global_registry_dict[prefix]['Systemds']
+        parsed = ast.literal_eval(data)
+        encoded = parsed[0].get('unit_file_b64')
+        self.assertIsNotNone(encoded)
+        restored = base64.b64decode(encoded.encode('ascii')).decode('utf-8')
+        self.assertEqual(restored, unit_file_text)
 
 
 if __name__ == '__main__':

@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import base64
 import os
 
 from util.logging import log
@@ -178,9 +179,11 @@ def _parse_policy_element(policy_element):
 
     unit_file = properties.find('UnitFile')
     unit_file_text = None
+    unit_file_b64 = None
     if unit_file is not None and unit_file.text is not None:
         # UnitFile mode=table is treated as plain text by design.
         unit_file_text = str(unit_file.text)
+        unit_file_b64 = base64.b64encode(unit_file_text.encode('utf-8')).decode('ascii')
 
     policy = systemd_policy(unit)
     policy.element_type = element_name.lower()
@@ -207,6 +210,7 @@ def _parse_policy_element(policy_element):
 
     policy.dropin_name = dropin_name
     policy.unit_file = unit_file_text
+    policy.unit_file_b64 = unit_file_b64
     policy.unit_file_mode = 'text'
     policy.file_dependencies = _parse_file_dependencies(properties)
 

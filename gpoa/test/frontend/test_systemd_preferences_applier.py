@@ -21,6 +21,7 @@ import os
 import sys
 import types
 import importlib
+import base64
 import unittest
 import unittest.mock
 
@@ -162,6 +163,73 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             with open(create_path, 'r', encoding='utf-8') as fh:
                 self.assertIn('gpupdate-managed uid: 11', fh.read())
             self.assertIn(['/bin/systemctl', 'daemon-reload'], commands)
+
+    def test_normalize_rule_unescapes_newline_sequences_in_unit_file(self):
+        spa = _load_spa()
+
+        normalized = spa._normalize_rule({
+            'uid': '12',
+            'unit': 'escaped.service',
+            'state': 'as_is',
+            'now': False,
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropin_name': '50-gpo.conf',
+            'unit_file': '[Service]\\nRestart=always',
+            'file_dependencies': [],
+            'element_type': 'service',
+        })
+
+        self.assertEqual(normalized['unit_file'], '[Service]\nRestart=always')
+
+    def test_normalize_rule_decodes_unit_file_b64_with_priority(self):
+        spa = _load_spa()
+
+        original = "[Service]\nExecStart=/bin/bash -c \"echo 'ok'\"\n"
+        encoded = base64.b64encode(original.encode('utf-8')).decode('ascii')
+        normalized = spa._normalize_rule({
+            'uid': '13',
+            'unit': 'encoded.service',
+            'state': 'as_is',
+            'now': False,
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropin_name': '50-gpo.conf',
+            'unit_file_b64': encoded,
+            'unit_file': '[Service]\\nExecStart=/bin/false',
+            'file_dependencies': [],
+            'element_type': 'service',
+        })
+
+        self.assertEqual(normalized['unit_file'], original)
+
+    def test_normalize_rule_falls_back_to_legacy_when_unit_file_b64_invalid(self):
+        spa = _load_spa()
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.log') as log_mock:
+            normalized = spa._normalize_rule({
+                'uid': '14',
+                'unit': 'encoded.service',
+                'state': 'as_is',
+                'now': False,
+                'apply_mode': 'always',
+                'policy_target': 'machine',
+                'edit_mode': 'override',
+                'dropin_name': '50-gpo.conf',
+                'unit_file_b64': 'invalid-%%%',
+                'unit_file': '[Service]\\nRestart=always',
+                'file_dependencies': [],
+                'element_type': 'service',
+            })
+
+        self.assertEqual(normalized['unit_file'], '[Service]\nRestart=always')
+        log_mock.assert_any_call('W47', {
+            'reason': 'Invalid unit_file_b64 payload',
+            'unit': 'encoded.service',
+            'uid': '14',
+        })
 
     def test_post_restart_uses_dependency_modes(self):
         spa = _load_spa()
