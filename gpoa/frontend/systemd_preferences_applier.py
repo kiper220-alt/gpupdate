@@ -232,6 +232,7 @@ def _normalize_rule(item):
         'unit': str(unit),
         'state': state,
         'now': _as_bool(item.get('now', False)),
+        'remove_policy': _as_bool(item.get('remove_policy', item.get('removePolicy', False))),
         'apply_mode': apply_mode,
         'policy_target': policy_target,
         'edit_mode': edit_mode,
@@ -413,7 +414,10 @@ class _systemd_preferences_runtime:
             error = str(exc)
             log('W50', {'context': self.context.mode, 'error': error})
             _syslog('W', 'daemon-reload failed', {'context': self.context.mode, 'error': error})
+            self.daemon_reload_required = False
+            return False
         self.daemon_reload_required = False
+        return True
 
     def _active_state(self, unit_name):
         try:
@@ -490,15 +494,25 @@ class _systemd_preferences_runtime:
             _syslog('W', 'State apply failed', {'unit': rule['unit'], 'state': state, 'error': str(exc)})
 
     def apply_rules(self, rules):
+        applicable_rules = []
         for rule in rules:
             log('D244', {'unit': rule['unit'], 'state': rule['state']})
             exists = self._exists(rule['unit'])
             if not _rule_matches_apply_mode(rule, exists):
                 continue
+            applicable_rules.append((rule, exists))
 
+        for rule, exists in applicable_rules:
             self._apply_edit(rule, exists)
-            if self.daemon_reload_required:
-                self._daemon_reload()
+
+        if self.daemon_reload_required and not self._daemon_reload():
+            _syslog('W', 'Skipping state apply due to daemon-reload failure', {
+                'context': self.context.mode,
+                'rules': len(applicable_rules),
+            })
+            return
+
+        for rule, _ in applicable_rules:
             self._run_state_action(rule)
             self.phase2_candidates.append(rule)
 
@@ -525,7 +539,12 @@ class _systemd_preferences_runtime:
                     pass
 
         if self.daemon_reload_required:
-            self._daemon_reload()
+            if not self._daemon_reload():
+                _syslog('W', 'Skipping cleanup restart due to daemon-reload failure', {
+                    'context': self.context.mode,
+                    'units': [unit_name for unit_name, _ in affected_units],
+                })
+                return
             for unit_name, element_type in affected_units:
                 cleanup_rule = {
                     'unit': unit_name,
@@ -580,9 +599,39 @@ def _get_rules_for_scope(storage, scope_name, target):
     return rules
 
 
+def _split_active_and_cleanup_rules(rules):
+    active_rules = []
+    explicit_cleanup_rules = []
+    for rule in rules:
+        if rule.get('remove_policy'):
+            explicit_cleanup_rules.append(rule)
+            continue
+        active_rules.append(rule)
+    return active_rules, explicit_cleanup_rules
+
+
+def _merge_cleanup_rules(removed_by_diff, explicit_cleanup_rules):
+    merged = {}
+    for rule in removed_by_diff:
+        merged[rule['uid']] = rule
+    for rule in explicit_cleanup_rules:
+        merged[rule['uid']] = rule
+    return list(merged.values())
+
+
+def _get_rule_sets_for_scope(storage, scope_name, target):
+    current_rules = _get_rules_for_scope(storage, scope_name, target)
+    active_rules, explicit_cleanup_rules = _split_active_and_cleanup_rules(current_rules)
+    removed_by_diff = _get_removed_rules(storage, scope_name, target)
+    cleanup_rules = _merge_cleanup_rules(removed_by_diff, explicit_cleanup_rules)
+    return active_rules, cleanup_rules
+
+
 def _collect_dependency_paths(storage, scope_name, target, username=None):
     dependency_paths = []
     for rule in _get_rules_for_scope(storage, scope_name, target):
+        if rule.get('remove_policy'):
+            continue
         for dependency in rule.get('file_dependencies', []):
             dep_path = _expand_windows_var(dependency.get('path'), username)
             if dep_path and os.path.isabs(dep_path):
@@ -612,9 +661,10 @@ class systemd_preferences_applier(applier_frontend):
 
         log('D240')
         runtime = _systemd_preferences_runtime(self.storage, self.__scope_name, _Context(mode='machine'))
-        rules = _get_rules_for_scope(self.storage, self.__scope_name, target='machine')
-        runtime.apply_rules(rules)
-        runtime.cleanup_removed_rules(_get_removed_rules(self.storage, self.__scope_name, target='machine'))
+        active_rules, cleanup_rules = _get_rule_sets_for_scope(
+            self.storage, self.__scope_name, target='machine')
+        runtime.apply_rules(active_rules)
+        runtime.cleanup_removed_rules(cleanup_rules)
         runtime.post_restart()
 
 
@@ -651,9 +701,10 @@ class systemd_preferences_applier_user(applier_frontend):
 
         log('D241', {'username': self.username})
         runtime = _systemd_preferences_runtime(self.storage, self.username, _Context(mode='machine'))
-        rules = _get_rules_for_scope(self.storage, self.username, target='machine')
-        runtime.apply_rules(rules)
-        runtime.cleanup_removed_rules(_get_removed_rules(self.storage, self.username, target='machine'))
+        active_rules, cleanup_rules = _get_rule_sets_for_scope(
+            self.storage, self.username, target='machine')
+        runtime.apply_rules(active_rules)
+        runtime.cleanup_removed_rules(cleanup_rules)
         runtime.post_restart()
 
     def user_context_apply(self):
@@ -673,7 +724,8 @@ class systemd_preferences_applier_user(applier_frontend):
             self.storage,
             self.username,
             _Context(mode='user', username=self.username))
-        rules = _get_rules_for_scope(self.storage, self.username, target='user')
-        runtime.apply_rules(rules)
-        runtime.cleanup_removed_rules(_get_removed_rules(self.storage, self.username, target='user'))
+        active_rules, cleanup_rules = _get_rule_sets_for_scope(
+            self.storage, self.username, target='user')
+        runtime.apply_rules(active_rules)
+        runtime.cleanup_removed_rules(cleanup_rules)
         runtime.post_restart(username=self.username)

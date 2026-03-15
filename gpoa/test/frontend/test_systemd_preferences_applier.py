@@ -39,28 +39,35 @@ class _storage_stub:
 
 
 class _manager_stub:
-    def __init__(self, exists_map=None, active_state_map=None):
+    def __init__(self, exists_map=None, active_state_map=None, reload_exc=None):
         self.exists_map = exists_map or {}
         self.active_state_map = active_state_map or {}
+        self.reload_exc = reload_exc
         self.exists_calls = []
         self.apply_state_calls = []
         self.restart_calls = []
         self.reload_calls = 0
+        self.call_order = []
 
     def exists(self, unit_name):
         self.exists_calls.append(unit_name)
         return self.exists_map.get(unit_name, False)
 
     def reload(self):
+        self.call_order.append('reload')
         self.reload_calls += 1
+        if self.reload_exc is not None:
+            raise self.reload_exc
 
     def active_state(self, unit_name):
         return self.active_state_map.get(unit_name, 'inactive')
 
     def restart(self, unit_name):
+        self.call_order.append('restart:{}'.format(unit_name))
         self.restart_calls.append(unit_name)
 
     def apply_state(self, unit_name, state, now):
+        self.call_order.append('apply_state:{}'.format(unit_name))
         self.apply_state_calls.append((unit_name, state, now))
 
 
@@ -175,6 +182,78 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 self.assertIn('gpupdate-managed uid: 11', fh.read())
             self.assertGreaterEqual(runtime.systemd_manager.reload_calls, 1)
 
+    def test_apply_rules_uses_reload_barrier_before_state_actions(self):
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        manager = _manager_stub(exists_map={'demo.service': False})
+        runtime.systemd_manager = manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            runtime.apply_rules([{
+                'uid': 'reload-order',
+                'unit': 'demo.service',
+                'state': 'enable',
+                'now': True,
+                'apply_mode': 'always',
+                'policy_target': 'machine',
+                'edit_mode': 'create',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': '[Unit]\nDescription=Demo',
+                'file_dependencies': [],
+                'element_type': 'service',
+            }])
+
+        self.assertEqual(manager.call_order, ['reload', 'apply_state:demo.service'])
+
+    def test_apply_rules_skips_state_actions_when_reload_fails(self):
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        manager = _manager_stub(
+            exists_map={'demo.service': False, 'stateonly.service': True},
+            reload_exc=spa.SystemdManagerError('reload failed', action='reload'),
+        )
+        runtime.systemd_manager = manager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            runtime.apply_rules([
+                {
+                    'uid': 'reload-fail',
+                    'unit': 'demo.service',
+                    'state': 'enable',
+                    'now': True,
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create',
+                    'dropin_name': '50-gpo.conf',
+                    'unit_file': '[Unit]\nDescription=Demo',
+                    'file_dependencies': [],
+                    'element_type': 'service',
+                },
+                {
+                    'uid': 'state-only',
+                    'unit': 'stateonly.service',
+                    'state': 'disable',
+                    'now': False,
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'override',
+                    'dropin_name': '50-gpo.conf',
+                    'unit_file': None,
+                    'file_dependencies': [],
+                    'element_type': 'service',
+                },
+            ])
+
+        self.assertEqual(manager.reload_calls, 1)
+        self.assertEqual(manager.apply_state_calls, [])
+        self.assertEqual(runtime.phase2_candidates, [])
+
     def test_normalize_rule_unescapes_newline_sequences_in_unit_file(self):
         spa = _load_spa()
 
@@ -193,6 +272,31 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
         })
 
         self.assertEqual(normalized['unit_file'], '[Service]\nRestart=always')
+
+    def test_normalize_rule_maps_remove_policy_aliases(self):
+        spa = _load_spa()
+
+        normalized_legacy = spa._normalize_rule({
+            'uid': 'rp-1',
+            'unit': 'demo.service',
+            'state': 'as_is',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'removePolicy': '1',
+        })
+        normalized_snake = spa._normalize_rule({
+            'uid': 'rp-2',
+            'unit': 'demo.service',
+            'state': 'as_is',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'remove_policy': True,
+        })
+
+        self.assertTrue(normalized_legacy['remove_policy'])
+        self.assertTrue(normalized_snake['remove_policy'])
 
     def test_normalize_rule_decodes_unit_file_b64_with_priority(self):
         spa = _load_spa()
@@ -385,6 +489,37 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0]['uid'], 'drop')
 
+    def test_get_rule_sets_for_scope_includes_remove_policy_cleanup(self):
+        spa = _load_spa()
+
+        storage = _storage_stub({
+            'Software/BaseALT/Policies/Preferences/Machine/Systemds': str([
+                {
+                    'uid': 'active',
+                    'unit': 'active.service',
+                    'state': 'enable',
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'override',
+                    'removePolicy': '0',
+                },
+                {
+                    'uid': 'cleanup',
+                    'unit': 'cleanup.service',
+                    'state': 'enable',
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create',
+                    'removePolicy': '1',
+                },
+            ]),
+            'Previous/Software/BaseALT/Policies/Preferences/Machine/Systemds': str([]),
+        })
+
+        active_rules, cleanup_rules = spa._get_rule_sets_for_scope(storage, 'Machine', 'machine')
+        self.assertEqual([rule['uid'] for rule in active_rules], ['active'])
+        self.assertEqual([rule['uid'] for rule in cleanup_rules], ['cleanup'])
+
     def test_normalize_rule_rejects_unsafe_unit_and_dropin_paths(self):
         spa = _load_spa()
 
@@ -458,6 +593,34 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             self.assertTrue(os.path.exists(managed))
             self.assertEqual(runtime.systemd_manager.reload_calls, 0)
 
+    def test_cleanup_removed_rules_skips_restart_when_reload_fails(self):
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(
+            active_state_map={'demo.service': 'active'},
+            reload_exc=spa.SystemdManagerError('reload failed', action='reload'),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            managed = os.path.join(tmpdir, 'demo.service')
+            with open(managed, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('# gpupdate-managed uid: deadbeef\n[Unit]\nDescription=test\n')
+
+            removed_rule = {
+                'uid': 'deadbeef',
+                'unit': 'demo.service',
+                'dropin_name': '50-gpo.conf',
+                'element_type': 'service',
+            }
+            runtime.cleanup_removed_rules([removed_rule])
+
+            self.assertFalse(os.path.exists(managed))
+            self.assertEqual(runtime.systemd_manager.reload_calls, 1)
+            self.assertEqual(runtime.systemd_manager.restart_calls, [])
+
     def test_write_rule_file_skips_symlink_target(self):
         spa = _load_spa()
 
@@ -512,6 +675,30 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 applier.prime_dependency_journal()
                 watch_many_mock.assert_called_once_with(['/etc/demo.conf'])
 
+    def test_prime_dependency_journal_skips_remove_policy_rules(self):
+        spa = _load_spa()
+
+        storage = _storage_stub({
+            'Software/BaseALT/Policies/Preferences/Machine/Systemds': str([{
+                'uid': 'rule-removed',
+                'unit': 'demo.service',
+                'state': 'as_is',
+                'apply_mode': 'always',
+                'policy_target': 'machine',
+                'edit_mode': 'override',
+                'removePolicy': '1',
+                'file_dependencies': [
+                    {'mode': 'changed', 'path': '/etc/demo.conf'},
+                ],
+            }]),
+        })
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.check_enabled', return_value=True):
+            applier = spa.systemd_preferences_applier(storage)
+            with unittest.mock.patch('frontend.systemd_preferences_applier.watch_many') as watch_many_mock:
+                applier.prime_dependency_journal()
+                watch_many_mock.assert_called_once_with([])
+
     def test_prime_dependency_journal_user_watches_machine_and_user_dependencies(self):
         spa = _load_spa()
 
@@ -550,6 +737,37 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                         applier.prime_dependency_journal()
                         expected_user_path = spa._expand_windows_var('%HOME%/.config/demo.conf', username='alice')
                         watch_many_mock.assert_called_once_with(['/etc/demo.conf', expected_user_path])
+
+    def test_apply_uses_cleanup_rules_for_remove_policy_items(self):
+        spa = _load_spa()
+
+        storage = _storage_stub({
+            'Software/BaseALT/Policies/Preferences/Machine/Systemds': str([
+                {
+                    'uid': 'cleanup',
+                    'unit': 'cleanup.service',
+                    'state': 'enable',
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create',
+                    'removePolicy': '1',
+                },
+            ]),
+            'Previous/Software/BaseALT/Policies/Preferences/Machine/Systemds': str([]),
+        })
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.check_enabled', return_value=True):
+            with unittest.mock.patch('frontend.systemd_preferences_applier._systemd_preferences_runtime') as runtime_ctor:
+                runtime = unittest.mock.Mock()
+                runtime_ctor.return_value = runtime
+
+                applier = spa.systemd_preferences_applier(storage)
+                applier.apply()
+
+                runtime.apply_rules.assert_called_once_with([])
+                cleanup_arg = runtime.cleanup_removed_rules.call_args[0][0]
+                self.assertEqual(len(cleanup_arg), 1)
+                self.assertEqual(cleanup_arg[0]['uid'], 'cleanup')
 
 
 if __name__ == '__main__':
