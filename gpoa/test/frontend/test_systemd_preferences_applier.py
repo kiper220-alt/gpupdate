@@ -24,6 +24,7 @@ import importlib
 import base64
 import unittest
 import unittest.mock
+from pathlib import Path
 
 
 class _storage_stub:
@@ -35,6 +36,33 @@ class _storage_stub:
 
     def get_key_value(self, path):
         return None
+
+
+class _manager_stub:
+    def __init__(self, exists_map=None, active_state_map=None):
+        self.exists_map = exists_map or {}
+        self.active_state_map = active_state_map or {}
+        self.exists_calls = []
+        self.apply_state_calls = []
+        self.restart_calls = []
+        self.reload_calls = 0
+
+    def exists(self, unit_name):
+        self.exists_calls.append(unit_name)
+        return self.exists_map.get(unit_name, False)
+
+    def reload(self):
+        self.reload_calls += 1
+
+    def active_state(self, unit_name):
+        return self.active_state_map.get(unit_name, 'inactive')
+
+    def restart(self, unit_name):
+        self.restart_calls.append(unit_name)
+
+    def apply_state(self, unit_name, state, now):
+        self.apply_state_calls.append((unit_name, state, now))
+
 
 def _load_spa():
     if 'frontend' not in sys.modules:
@@ -48,113 +76,96 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
     def test_apply_mode_skips_non_matching_rules(self):
         spa = _load_spa()
 
-        commands = []
-
-        def fake_run(command):
-            commands.append(command)
-            if any('LoadState' in part for part in command):
-                unit_name = command[-1]
-                if unit_name == 'exists.service':
-                    return 0, 'loaded', ''
-                return 0, 'not-found', ''
-            return 0, '', ''
-
         storage = _storage_stub()
         runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
-        with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
-            runtime.apply_rules([
-                {
-                    'uid': '1',
-                    'unit': 'missing.service',
-                    'state': 'enable',
-                    'now': False,
-                    'apply_mode': 'if_exists',
-                    'policy_target': 'machine',
-                    'edit_mode': 'override',
-                    'dropin_name': '50-gpo.conf',
-                    'unit_file': None,
-                    'file_dependencies': [],
-                    'element_type': 'service',
-                },
-                {
-                    'uid': '2',
-                    'unit': 'exists.service',
-                    'state': 'disable',
-                    'now': False,
-                    'apply_mode': 'if_missing',
-                    'policy_target': 'machine',
-                    'edit_mode': 'override',
-                    'dropin_name': '50-gpo.conf',
-                    'unit_file': None,
-                    'file_dependencies': [],
-                    'element_type': 'service',
-                },
-                {
-                    'uid': '3',
-                    'unit': 'exists.service',
-                    'state': 'enable',
-                    'now': False,
-                    'apply_mode': 'always',
-                    'policy_target': 'machine',
-                    'edit_mode': 'override',
-                    'dropin_name': '50-gpo.conf',
-                    'unit_file': None,
-                    'file_dependencies': [],
-                    'element_type': 'service',
-                },
-            ])
+        manager = _manager_stub(exists_map={
+            'exists.service': True,
+            'missing.service': False,
+        })
+        runtime.systemd_manager = manager
+        runtime.apply_rules([
+            {
+                'uid': '1',
+                'unit': 'missing.service',
+                'state': 'enable',
+                'now': False,
+                'apply_mode': 'if_exists',
+                'policy_target': 'machine',
+                'edit_mode': 'override',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': None,
+                'file_dependencies': [],
+                'element_type': 'service',
+            },
+            {
+                'uid': '2',
+                'unit': 'exists.service',
+                'state': 'disable',
+                'now': False,
+                'apply_mode': 'if_missing',
+                'policy_target': 'machine',
+                'edit_mode': 'override',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': None,
+                'file_dependencies': [],
+                'element_type': 'service',
+            },
+            {
+                'uid': '3',
+                'unit': 'exists.service',
+                'state': 'enable',
+                'now': False,
+                'apply_mode': 'always',
+                'policy_target': 'machine',
+                'edit_mode': 'override',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': None,
+                'file_dependencies': [],
+                'element_type': 'service',
+            },
+        ])
 
-        self.assertIn(['/bin/systemctl', 'enable', 'exists.service'], commands)
-        self.assertNotIn(['/bin/systemctl', 'enable', 'missing.service'], commands)
-        self.assertNotIn(['/bin/systemctl', 'disable', 'exists.service'], commands)
+        self.assertEqual(manager.apply_state_calls, [('exists.service', 'enable', False)])
 
     def test_edit_mode_create_or_override_writes_expected_paths(self):
         spa = _load_spa()
 
-        commands = []
-
-        def fake_run(command):
-            commands.append(command)
-            if any('LoadState' in part for part in command):
-                unit_name = command[-1]
-                if unit_name == 'exists.service':
-                    return 0, 'loaded', ''
-                return 0, 'not-found', ''
-            return 0, '', ''
-
         storage = _storage_stub()
         runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(exists_map={
+            'exists.service': True,
+            'new.service': False,
+        })
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime.context.systemd_dir = tmpdir
-            with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
-                runtime.apply_rules([
-                    {
-                        'uid': '10',
-                        'unit': 'exists.service',
-                        'state': 'as_is',
-                        'now': False,
-                        'apply_mode': 'always',
-                        'policy_target': 'machine',
-                        'edit_mode': 'create_or_override',
-                        'dropin_name': 'custom.conf',
-                        'unit_file': '[Service]\nRestart=always',
-                        'file_dependencies': [],
-                        'element_type': 'service',
-                    },
-                    {
-                        'uid': '11',
-                        'unit': 'new.service',
-                        'state': 'as_is',
-                        'now': False,
-                        'apply_mode': 'always',
-                        'policy_target': 'machine',
-                        'edit_mode': 'create_or_override',
-                        'dropin_name': 'custom.conf',
-                        'unit_file': '[Service]\nRestart=no',
-                        'file_dependencies': [],
-                        'element_type': 'service',
-                    },
-                ])
+            runtime.apply_rules([
+                {
+                    'uid': '10',
+                    'unit': 'exists.service',
+                    'state': 'as_is',
+                    'now': False,
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create_or_override',
+                    'dropin_name': 'custom.conf',
+                    'unit_file': '[Service]\nRestart=always',
+                    'file_dependencies': [],
+                    'element_type': 'service',
+                },
+                {
+                    'uid': '11',
+                    'unit': 'new.service',
+                    'state': 'as_is',
+                    'now': False,
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create_or_override',
+                    'dropin_name': 'custom.conf',
+                    'unit_file': '[Service]\nRestart=no',
+                    'file_dependencies': [],
+                    'element_type': 'service',
+                },
+            ])
 
             dropin_path = '{}/exists.service.d/custom.conf'.format(tmpdir)
             create_path = '{}/new.service'.format(tmpdir)
@@ -162,7 +173,7 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 self.assertIn('gpupdate-managed uid: 10', fh.read())
             with open(create_path, 'r', encoding='utf-8') as fh:
                 self.assertIn('gpupdate-managed uid: 11', fh.read())
-            self.assertIn(['/bin/systemctl', 'daemon-reload'], commands)
+            self.assertGreaterEqual(runtime.systemd_manager.reload_calls, 1)
 
     def test_normalize_rule_unescapes_newline_sequences_in_unit_file(self):
         spa = _load_spa()
@@ -231,19 +242,64 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             'uid': '14',
         })
 
+    def test_normalize_rule_rejects_too_many_dependencies(self):
+        spa = _load_spa()
+
+        too_many = [{'mode': 'changed', 'path': '/etc/demo{}'.format(idx)} for idx in range(64)]
+        normalized = spa._normalize_rule({
+            'uid': '15',
+            'unit': 'demo.service',
+            'state': 'as_is',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropin_name': '50-gpo.conf',
+            'file_dependencies': too_many,
+        })
+        self.assertIsNone(normalized)
+
+    def test_normalize_rule_filters_invalid_dependency_paths(self):
+        spa = _load_spa()
+
+        normalized = spa._normalize_rule({
+            'uid': '16',
+            'unit': 'demo.service',
+            'state': 'as_is',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropin_name': '50-gpo.conf',
+            'file_dependencies': [
+                {'mode': 'changed', 'path': '/etc/demo.conf'},
+                {'mode': 'changed', 'path': '../relative'},
+                {'mode': 'changed', 'path': '/tmp/\ninvalid'},
+            ],
+        })
+        self.assertEqual(normalized['file_dependencies'], [{'mode': 'changed', 'path': '/etc/demo.conf'}])
+
+    def test_normalize_rule_rejects_oversized_unit_file(self):
+        spa = _load_spa()
+
+        huge_payload = 'A' * (spa.MAX_UNIT_FILE_SIZE + 1)
+        encoded = base64.b64encode(huge_payload.encode('utf-8')).decode('ascii')
+        normalized = spa._normalize_rule({
+            'uid': '17',
+            'unit': 'huge.service',
+            'state': 'as_is',
+            'apply_mode': 'always',
+            'policy_target': 'machine',
+            'edit_mode': 'override',
+            'dropin_name': '50-gpo.conf',
+            'unit_file_b64': encoded,
+        })
+        self.assertIsNone(normalized['unit_file'])
+
     def test_post_restart_uses_dependency_modes(self):
         spa = _load_spa()
 
-        commands = []
-
-        def fake_run(command):
-            commands.append(command)
-            if any('ActiveState' in part for part in command):
-                return 0, 'active', ''
-            return 0, '', ''
-
         storage = _storage_stub()
         runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(active_state_map={'demo.service': 'active'})
         runtime.phase2_candidates = [{
             'uid': '1',
             'unit': 'demo.service',
@@ -261,26 +317,18 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             'element_type': 'service',
         }]
 
-        with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
-            with unittest.mock.patch('frontend.systemd_preferences_applier.query') as query_mock:
-                query_mock.side_effect = lambda path, mode='changed': mode == 'changed'
-                runtime.post_restart()
+        with unittest.mock.patch('frontend.systemd_preferences_applier.query') as query_mock:
+            query_mock.side_effect = lambda path, mode='changed': mode == 'changed'
+            runtime.post_restart()
 
-        self.assertIn(['/bin/systemctl', 'restart', 'demo.service'], commands)
+        self.assertIn('demo.service', runtime.systemd_manager.restart_calls)
 
     def test_post_restart_skips_when_dependency_unchanged(self):
         spa = _load_spa()
 
-        commands = []
-
-        def fake_run(command):
-            commands.append(command)
-            if any('ActiveState' in part for part in command):
-                return 0, 'active', ''
-            return 0, '', ''
-
         storage = _storage_stub()
         runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(active_state_map={'demo.service': 'active'})
         runtime.phase2_candidates = [{
             'uid': '1',
             'unit': 'demo.service',
@@ -297,11 +345,10 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             'element_type': 'service',
         }]
 
-        with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
-            with unittest.mock.patch('frontend.systemd_preferences_applier.query', return_value=False):
-                runtime.post_restart()
+        with unittest.mock.patch('frontend.systemd_preferences_applier.query', return_value=False):
+            runtime.post_restart()
 
-        self.assertNotIn(['/bin/systemctl', 'restart', 'demo.service'], commands)
+        self.assertNotIn('demo.service', runtime.systemd_manager.restart_calls)
 
     def test_removed_rules_detected_from_previous_snapshot(self):
         spa = _load_spa()
@@ -364,16 +411,9 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
     def test_cleanup_removed_rules_keeps_non_restartable_types_skipped(self):
         spa = _load_spa()
 
-        commands = []
-
-        def fake_run(command):
-            commands.append(command)
-            if any('ActiveState' in part for part in command):
-                return 0, 'active', ''
-            return 0, '', ''
-
         storage = _storage_stub()
         runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(active_state_map={'usb.device': 'active'})
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime.context.systemd_dir = tmpdir
@@ -388,12 +428,55 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 'element_type': 'device',
             }
 
-            with unittest.mock.patch('frontend.systemd_preferences_applier._run_command', side_effect=fake_run):
-                runtime.cleanup_removed_rules([removed_rule])
+            runtime.cleanup_removed_rules([removed_rule])
 
             self.assertFalse(os.path.exists(managed))
-            self.assertIn(['/bin/systemctl', 'daemon-reload'], commands)
-            self.assertNotIn(['/bin/systemctl', 'restart', 'usb.device'], commands)
+            self.assertEqual(runtime.systemd_manager.reload_calls, 1)
+            self.assertNotIn('usb.device', runtime.systemd_manager.restart_calls)
+
+    def test_cleanup_removed_rules_requires_marker_on_first_line(self):
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(active_state_map={'demo.service': 'active'})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            managed = os.path.join(tmpdir, 'demo.service')
+            with open(managed, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('[Unit]\n# gpupdate-managed uid: deadbeef\nDescription=test\n')
+
+            removed_rule = {
+                'uid': 'deadbeef',
+                'unit': 'demo.service',
+                'dropin_name': '50-gpo.conf',
+                'element_type': 'service',
+            }
+            runtime.cleanup_removed_rules([removed_rule])
+
+            self.assertTrue(os.path.exists(managed))
+            self.assertEqual(runtime.systemd_manager.reload_calls, 0)
+
+    def test_write_rule_file_skips_symlink_target(self):
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime.context.systemd_dir = tmpdir
+            real_target = os.path.join(tmpdir, 'real.service')
+            with open(real_target, 'w', encoding='utf-8') as file_obj:
+                file_obj.write('real')
+
+            symlink_target = os.path.join(tmpdir, 'evil.service')
+            os.symlink(real_target, symlink_target)
+
+            runtime._write_rule_file(Path(symlink_target), 'uid-1', '[Unit]\nDescription=test')
+            with open(real_target, 'r', encoding='utf-8') as file_obj:
+                self.assertEqual(file_obj.read(), 'real')
 
     def test_user_context_skips_when_user_manager_unavailable(self):
         spa = _load_spa()

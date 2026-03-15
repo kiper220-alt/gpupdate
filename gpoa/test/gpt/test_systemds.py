@@ -156,6 +156,56 @@ class GptSystemdsTestCase(unittest.TestCase):
         restored = base64.b64decode(items[0].unit_file_b64.encode('ascii')).decode('utf-8')
         self.assertEqual(restored, unit_file_text)
 
+    def test_read_systemds_rejects_invalid_dependency_path(self):
+        import gpt.systemds
+
+        xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<Systemds clsid="{{ROOT}}" disabled="0">
+  <Service clsid="{{C1}}" name="dep" uid="{{U1}}">
+    <Properties unit="dep" state="as_is">
+      <FileDependencies>
+        <Dependency mode="changed" path="../relative"/>
+      </FileDependencies>
+    </Properties>
+  </Service>
+</Systemds>
+"""
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.xml', delete=False) as file_obj:
+            file_obj.write(xml_content)
+            tmp_path = file_obj.name
+
+        try:
+            items = gpt.systemds.read_systemds(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].file_dependencies, [])
+
+    def test_read_systemds_rejects_oversized_unit_file(self):
+        import gpt.systemds
+
+        unit_file_text = "A" * (gpt.systemds.MAX_UNIT_FILE_SIZE + 1)
+        xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<Systemds clsid="{{ROOT}}" disabled="0">
+  <Service clsid="{{C1}}" name="big" uid="{{U1}}">
+    <Properties unit="big" state="as_is">
+      <UnitFile mode="text">{}</UnitFile>
+    </Properties>
+  </Service>
+</Systemds>
+""".format(unit_file_text)
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.xml', delete=False) as file_obj:
+            file_obj.write(xml_content)
+            tmp_path = file_obj.name
+
+        try:
+            items = gpt.systemds.read_systemds(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertEqual(items, [])
+
     def test_gpt_discovery_supports_windows_systemd_layout(self):
         gpt_helpers = _load_gpt_discovery_helpers()
 
