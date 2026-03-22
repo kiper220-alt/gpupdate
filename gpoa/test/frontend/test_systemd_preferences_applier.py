@@ -675,6 +675,42 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 applier.prime_dependency_journal()
                 watch_many_mock.assert_called_once_with(['/etc/demo.conf'])
 
+    def test_prime_dependency_journal_machine_watches_global_user_dependencies(self):
+        spa = _load_spa()
+
+        storage = _storage_stub({
+            'Software/BaseALT/Policies/Preferences/Machine/Systemds': str([
+                {
+                    'uid': 'rule-machine',
+                    'unit': 'demo.service',
+                    'state': 'as_is',
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'override',
+                    'file_dependencies': [
+                        {'mode': 'changed', 'path': '/etc/demo.conf'},
+                    ],
+                },
+                {
+                    'uid': 'rule-global-user',
+                    'unit': 'demo-user.service',
+                    'state': 'as_is',
+                    'apply_mode': 'always',
+                    'policy_target': 'user',
+                    'edit_mode': 'override',
+                    'file_dependencies': [
+                        {'mode': 'changed', 'path': '/etc/demo-user.conf'},
+                    ],
+                },
+            ]),
+        })
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.check_enabled', return_value=True):
+            applier = spa.systemd_preferences_applier(storage)
+            with unittest.mock.patch('frontend.systemd_preferences_applier.watch_many') as watch_many_mock:
+                applier.prime_dependency_journal()
+                watch_many_mock.assert_called_once_with(['/etc/demo.conf', '/etc/demo-user.conf'])
+
     def test_prime_dependency_journal_skips_remove_policy_rules(self):
         spa = _load_spa()
 
@@ -759,7 +795,8 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
         with unittest.mock.patch('frontend.systemd_preferences_applier.check_enabled', return_value=True):
             with unittest.mock.patch('frontend.systemd_preferences_applier._systemd_preferences_runtime') as runtime_ctor:
                 runtime = unittest.mock.Mock()
-                runtime_ctor.return_value = runtime
+                global_runtime = unittest.mock.Mock()
+                runtime_ctor.side_effect = [runtime, global_runtime]
 
                 applier = spa.systemd_preferences_applier(storage)
                 applier.apply()
@@ -768,6 +805,53 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
                 cleanup_arg = runtime.cleanup_removed_rules.call_args[0][0]
                 self.assertEqual(len(cleanup_arg), 1)
                 self.assertEqual(cleanup_arg[0]['uid'], 'cleanup')
+                global_runtime.apply_rules.assert_called_once_with([])
+                global_runtime.cleanup_removed_rules.assert_called_once_with([])
+
+    def test_machine_apply_routes_global_user_rules_to_global_context(self):
+        spa = _load_spa()
+
+        storage = _storage_stub({
+            'Software/BaseALT/Policies/Preferences/Machine/Systemds': str([
+                {
+                    'uid': 'machine-rule',
+                    'unit': 'machine.service',
+                    'state': 'enable',
+                    'apply_mode': 'always',
+                    'policy_target': 'machine',
+                    'edit_mode': 'create',
+                },
+                {
+                    'uid': 'global-user-rule',
+                    'unit': 'global-user.service',
+                    'state': 'enable',
+                    'apply_mode': 'always',
+                    'policy_target': 'user',
+                    'edit_mode': 'create',
+                },
+            ]),
+            'Previous/Software/BaseALT/Policies/Preferences/Machine/Systemds': str([]),
+        })
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.check_enabled', return_value=True):
+            with unittest.mock.patch('frontend.systemd_preferences_applier._systemd_preferences_runtime') as runtime_ctor:
+                runtime = unittest.mock.Mock()
+                global_runtime = unittest.mock.Mock()
+                runtime_ctor.side_effect = [runtime, global_runtime]
+
+                applier = spa.systemd_preferences_applier(storage)
+                applier.apply()
+
+                self.assertEqual(runtime_ctor.call_args_list[0][0][2].mode, 'machine')
+                self.assertEqual(runtime_ctor.call_args_list[1][0][2].mode, 'global_user')
+                runtime.apply_rules.assert_called_once_with([
+                    unittest.mock.ANY,
+                ])
+                self.assertEqual(runtime.apply_rules.call_args[0][0][0]['uid'], 'machine-rule')
+                global_runtime.apply_rules.assert_called_once_with([
+                    unittest.mock.ANY,
+                ])
+                self.assertEqual(global_runtime.apply_rules.call_args[0][0][0]['uid'], 'global-user-rule')
 
 
 if __name__ == '__main__':

@@ -58,6 +58,8 @@ class _Context:
         self.systemd_dir = '/etc/systemd/system'
         if mode == 'user':
             self.systemd_dir = os.path.join(get_homedir(username), '.config/systemd/user')
+        elif mode == 'global_user':
+            self.systemd_dir = '/etc/systemd/user'
 
 
 def _syslog(level, message, data=None):
@@ -652,7 +654,10 @@ class systemd_preferences_applier(applier_frontend):
     def prime_dependency_journal(self):
         if not self.__module_enabled:
             return
-        watch_many(_collect_dependency_paths(self.storage, self.__scope_name, target='machine'))
+        dependency_paths = []
+        dependency_paths.extend(_collect_dependency_paths(self.storage, self.__scope_name, target='machine'))
+        dependency_paths.extend(_collect_dependency_paths(self.storage, self.__scope_name, target='user'))
+        watch_many(dependency_paths)
 
     def apply(self):
         if not self.__module_enabled:
@@ -666,6 +671,20 @@ class systemd_preferences_applier(applier_frontend):
         runtime.apply_rules(active_rules)
         runtime.cleanup_removed_rules(cleanup_rules)
         runtime.post_restart()
+
+        global_user_runtime = _systemd_preferences_runtime(
+            self.storage,
+            self.__scope_name,
+            _Context(mode='global_user'),
+        )
+        active_user_rules, cleanup_user_rules = _get_rule_sets_for_scope(
+            self.storage,
+            self.__scope_name,
+            target='user',
+        )
+        global_user_runtime.apply_rules(active_user_rules)
+        global_user_runtime.cleanup_removed_rules(cleanup_user_rules)
+        global_user_runtime.post_restart()
 
 
 class systemd_preferences_applier_user(applier_frontend):

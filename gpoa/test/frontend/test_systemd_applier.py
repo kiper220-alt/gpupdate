@@ -136,6 +136,13 @@ class _fake_dbus_module:
         return proxy.ifaces[iface_name]
 
 
+class _fake_subprocess_result:
+    def __init__(self, returncode=0, stdout='', stderr=''):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class SystemdApplierTestCase(unittest.TestCase):
     def test_run_skips_invalid_unit_name(self):
         module = _load_systemd_applier_module()
@@ -194,6 +201,54 @@ class SystemdApplierTestCase(unittest.TestCase):
             manager = module.SystemdManager(mode='machine')
 
         self.assertFalse(manager.exists('demo.service'))
+
+    def test_global_manager_exists_uses_systemctl_global_cat(self):
+        module = _load_systemd_manager_module()
+
+        with unittest.mock.patch('frontend.appliers.systemd.subprocess.run') as run_mock:
+            run_mock.return_value = _fake_subprocess_result(returncode=0, stdout='# /etc/systemd/user/demo.service\n')
+            manager = module.SystemdManager(mode='global_user')
+
+            self.assertTrue(manager.exists('demo.service'))
+            run_mock.assert_called_once_with(
+                ['systemctl', '--global', 'cat', 'demo.service'],
+                stdout=module.subprocess.PIPE,
+                stderr=module.subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+    def test_global_manager_apply_state_ignores_now_runtime_actions(self):
+        module = _load_systemd_manager_module()
+
+        with unittest.mock.patch('frontend.appliers.systemd.subprocess.run') as run_mock:
+            run_mock.side_effect = [
+                _fake_subprocess_result(returncode=0),
+                _fake_subprocess_result(returncode=0),
+            ]
+            manager = module.SystemdManager(mode='global_user')
+            start_mock = unittest.mock.Mock(side_effect=AssertionError('start() must not be used for --global'))
+            manager.start = start_mock
+
+            manager.apply_state('demo.service', 'enable', now=True)
+
+            self.assertEqual(run_mock.call_args_list, [
+                unittest.mock.call(
+                    ['systemctl', '--global', 'unmask', 'demo.service'],
+                    stdout=module.subprocess.PIPE,
+                    stderr=module.subprocess.PIPE,
+                    text=True,
+                    check=False,
+                ),
+                unittest.mock.call(
+                    ['systemctl', '--global', 'enable', 'demo.service'],
+                    stdout=module.subprocess.PIPE,
+                    stderr=module.subprocess.PIPE,
+                    text=True,
+                    check=False,
+                ),
+            ])
+            start_mock.assert_not_called()
 
 
 if __name__ == '__main__':

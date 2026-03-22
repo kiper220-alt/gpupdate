@@ -17,6 +17,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import re
+import subprocess
 
 from util.logging import log
 
@@ -60,6 +61,15 @@ def _import_dbus():
 
 class SystemdManager:
     def __init__(self, mode='machine'):
+        self.mode = mode
+        self.dbus = None
+        self.bus = None
+        self.systemd = None
+        self.manager = None
+
+        if mode == 'global_user':
+            return
+
         self.dbus = _import_dbus()
         if mode == 'user':
             self.bus = self.dbus.SessionBus()
@@ -75,6 +85,33 @@ class SystemdManager:
             dbus_name = exc.get_dbus_name()
         raise SystemdManagerError(str(exc), action=action, unit=unit, dbus_name=dbus_name)
 
+    def _run_global(self, args):
+        return subprocess.run(
+            ['systemctl', '--global'] + list(args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+    def _global_output(self, result):
+        output = '{}\n{}'.format(result.stdout or '', result.stderr or '').strip()
+        return output or 'systemctl --global command failed'
+
+    def _global_not_found(self, result):
+        output = self._global_output(result).lower()
+        return 'no files found' in output or 'not-found' in output or 'not found' in output
+
+    def _fail_global(self, action, result, unit=None):
+        raise SystemdManagerError(self._global_output(result), action=action, unit=unit)
+
+    def _unsupported_global_action(self, action, unit=None):
+        raise SystemdManagerError(
+            'systemctl --global does not support runtime action {}'.format(action),
+            action=action,
+            unit=unit,
+        )
+
     def _load_unit(self, unit_name):
         try:
             return self.manager.LoadUnit(self.dbus.String(unit_name))
@@ -84,6 +121,14 @@ class SystemdManager:
     def exists(self, unit_name):
         if not is_valid_unit_name(unit_name):
             return False
+
+        if self.mode == 'global_user':
+            result = self._run_global(['cat', unit_name])
+            if result.returncode == 0:
+                return True
+            if self._global_not_found(result):
+                return False
+            self._fail_global('exists', result, unit=unit_name)
 
         try:
             unit_path = self.manager.LoadUnit(self.dbus.String(unit_name))
@@ -104,6 +149,8 @@ class SystemdManager:
     def active_state(self, unit_name):
         if not is_valid_unit_name(unit_name):
             return None
+        if self.mode == 'global_user':
+            return None
         try:
             properties = self._unit_properties(unit_name)
             return str(properties.Get(SYSTEMD_UNIT_IFACE, 'ActiveState'))
@@ -111,60 +158,99 @@ class SystemdManager:
             self._fail('active_state', exc, unit=unit_name)
 
     def reload(self):
+        if self.mode == 'global_user':
+            return
         try:
             self.manager.Reload()
         except self.dbus.DBusException as exc:
             self._fail('reload', exc)
 
     def start(self, unit_name):
+        if self.mode == 'global_user':
+            self._unsupported_global_action('start', unit=unit_name)
         try:
             self.manager.StartUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
             self._fail('start', exc, unit=unit_name)
 
     def stop(self, unit_name):
+        if self.mode == 'global_user':
+            self._unsupported_global_action('stop', unit=unit_name)
         try:
             self.manager.StopUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
             self._fail('stop', exc, unit=unit_name)
 
     def restart(self, unit_name):
+        if self.mode == 'global_user':
+            self._unsupported_global_action('restart', unit=unit_name)
         try:
             self.manager.RestartUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
             self._fail('restart', exc, unit=unit_name)
 
     def enable(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['enable', unit_name])
+            if result.returncode != 0:
+                self._fail_global('enable', result, unit=unit_name)
+            return
         try:
             self.manager.EnableUnitFiles([unit_name], self.dbus.Boolean(False), self.dbus.Boolean(True))
         except self.dbus.DBusException as exc:
             self._fail('enable', exc, unit=unit_name)
 
     def disable(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['disable', unit_name])
+            if result.returncode != 0:
+                self._fail_global('disable', result, unit=unit_name)
+            return
         try:
             self.manager.DisableUnitFiles([unit_name], self.dbus.Boolean(False))
         except self.dbus.DBusException as exc:
             self._fail('disable', exc, unit=unit_name)
 
     def mask(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['mask', unit_name])
+            if result.returncode != 0:
+                self._fail_global('mask', result, unit=unit_name)
+            return
         try:
             self.manager.MaskUnitFiles([unit_name], self.dbus.Boolean(False), self.dbus.Boolean(True))
         except self.dbus.DBusException as exc:
             self._fail('mask', exc, unit=unit_name)
 
     def unmask(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['unmask', unit_name])
+            if result.returncode != 0:
+                self._fail_global('unmask', result, unit=unit_name)
+            return
         try:
             self.manager.UnmaskUnitFiles([unit_name], self.dbus.Boolean(False))
         except self.dbus.DBusException as exc:
             self._fail('unmask', exc, unit=unit_name)
 
     def preset(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['preset', unit_name])
+            if result.returncode != 0:
+                self._fail_global('preset', result, unit=unit_name)
+            return
         try:
             self.manager.PresetUnitFiles([unit_name], self.dbus.Boolean(False), self.dbus.Boolean(True))
         except self.dbus.DBusException as exc:
             self._fail('preset', exc, unit=unit_name)
 
     def get_unit_file_state(self, unit_name):
+        if self.mode == 'global_user':
+            result = self._run_global(['is-enabled', unit_name])
+            state = (result.stdout or result.stderr or '').strip()
+            if state:
+                return state.splitlines()[-1].strip()
+            self._fail_global('get_unit_file_state', result, unit=unit_name)
         try:
             return str(self.manager.GetUnitFileState(self.dbus.String(unit_name)))
         except self.dbus.DBusException as exc:
@@ -176,27 +262,27 @@ class SystemdManager:
         if state == 'enable':
             self.unmask(unit_name)
             self.enable(unit_name)
-            if now:
+            if now and self.mode != 'global_user':
                 self.start(unit_name)
             return
         if state == 'disable':
-            if now:
+            if now and self.mode != 'global_user':
                 self.stop(unit_name)
             self.disable(unit_name)
             return
         if state == 'mask':
-            if now:
+            if now and self.mode != 'global_user':
                 self.stop(unit_name)
             self.mask(unit_name)
             return
         if state == 'unmask':
             self.unmask(unit_name)
-            if now:
+            if now and self.mode != 'global_user':
                 self.start(unit_name)
             return
         if state == 'preset':
             self.preset(unit_name)
-            if now:
+            if now and self.mode != 'global_user':
                 self.start(unit_name)
             return
         raise ValueError('Unsupported state: {}'.format(state))
