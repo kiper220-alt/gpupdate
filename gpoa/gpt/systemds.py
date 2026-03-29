@@ -18,12 +18,24 @@
 
 import base64
 import os
-import re
 from xml.etree import ElementTree
 
 from util.logging import log
 
 from .dynamic_attributes import DynamicAttributes
+from .systemds_constants import (
+    DEFAULT_DROPIN_NAME,
+    DROPIN_NAME_RE,
+    MAX_DEPENDENCIES_PER_RULE,
+    MAX_DEPENDENCY_PATH_LEN,
+    MAX_UNIT_FILE_SIZE,
+    UNIT_NAME_RE,
+    VALID_APPLY_MODES,
+    VALID_DEP_MODES,
+    VALID_EDIT_MODES,
+    VALID_POLICY_TARGETS,
+    VALID_STATES,
+)
 
 
 VALID_POLICY_ELEMENTS = {
@@ -39,20 +51,6 @@ VALID_POLICY_ELEMENTS = {
     'Slice',
     'Scope',
 }
-
-VALID_STATES = {'as_is', 'enable', 'disable', 'mask', 'unmask', 'preset'}
-VALID_APPLY_MODES = {'always', 'if_exists', 'if_missing'}
-VALID_POLICY_TARGETS = {'machine', 'user'}
-VALID_EDIT_MODES = {'create', 'override', 'create_or_override'}
-VALID_DEP_MODES = {'changed', 'presence_changed'}
-DEFAULT_DROPIN_NAME = '50-gpo.conf'
-DROPIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@-]{1,128}\.conf$')
-UNIT_NAME_RE = re.compile(
-    r'^[A-Za-z0-9:_.@-]{1,255}\.(service|socket|timer|path|mount|automount|swap|target|device|slice|scope)$'
-)
-MAX_DEPENDENCIES_PER_RULE = 32
-MAX_DEPENDENCY_PATH_LEN = 4096
-MAX_UNIT_FILE_SIZE = 128 * 1024
 
 UNIT_SUFFIX = {
     'Service': '.service',
