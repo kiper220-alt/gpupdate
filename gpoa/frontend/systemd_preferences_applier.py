@@ -20,7 +20,6 @@ import base64
 import binascii
 import os
 from pathlib import Path
-import re
 import stat
 import tempfile
 
@@ -34,21 +33,22 @@ from .appliers.systemd import (
     is_valid_unit_name,
 )
 from .change_journal import query, record_changed, record_presence_changed, watch_many
+from gpt.systemds_constants import (
+    DEFAULT_DROPIN_NAME,
+    DROPIN_NAME_RE,
+    MAX_DEPENDENCIES_PER_RULE,
+    MAX_DEPENDENCY_PATH_LEN,
+    MAX_UNIT_FILE_SIZE,
+    NON_RESTARTABLE_TYPES,
+    VALID_APPLY_MODES,
+    VALID_DEP_MODES,
+    VALID_EDIT_MODES,
+    VALID_POLICY_TARGETS,
+    VALID_STATES,
+)
 
-
-DEFAULT_DROPIN_NAME = '50-gpo.conf'
 MANAGED_HEADER = '# gpupdate-managed uid: {}'
-VALID_STATES = {'as_is', 'enable', 'disable', 'mask', 'unmask', 'preset'}
-VALID_APPLY_MODES = {'always', 'if_exists', 'if_missing'}
-VALID_POLICY_TARGETS = {'machine', 'user'}
-VALID_EDIT_MODES = {'create', 'override', 'create_or_override'}
-VALID_DEP_MODES = {'changed', 'presence_changed'}
-NON_RESTARTABLE_TYPES = {'device', 'scope'}
-DROPIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@-]{1,128}\.conf$')
 MAX_RULES_PER_SCOPE = 512
-MAX_DEPENDENCIES_PER_RULE = 32
-MAX_DEPENDENCY_PATH_LEN = 4096
-MAX_UNIT_FILE_SIZE = 128 * 1024
 
 
 class _Context:
@@ -320,12 +320,7 @@ def _safe_write_text(path, content):
         os.close(tmp_fd)
         tmp_fd = None
         os.replace(tmp_path, str(path))
-        dir_fd = os.open(str(parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        return True, existed
+        tmp_path = None  # consumed by replace; prevent unlink in finally
     except OSError:
         return False, existed
     finally:
@@ -339,6 +334,17 @@ def _safe_write_text(path, content):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    try:
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass  # fsync failure is non-fatal; file is already atomically written
+
+    return True, existed
 
 
 def _normalize_unit_file_content(unit_file):
@@ -427,10 +433,28 @@ class _systemd_preferences_runtime:
         except SystemdManagerError:
             return None
 
+    def _stop(self, rule):
+        if rule.get('element_type') in NON_RESTARTABLE_TYPES:
+            return
+        if self.context.mode == 'global_user':
+            return
+        state = self._active_state(rule['unit'])
+        if state not in ('active', 'activating', 'deactivating'):
+            return
+        try:
+            self._manager().stop(rule['unit'])
+        except SystemdManagerError as exc:
+            _syslog('W', 'Stop failed', {'unit': rule['unit'], 'error': str(exc)})
+
     def _restart(self, rule):
         if rule.get('element_type') in NON_RESTARTABLE_TYPES:
             log('W49', {'unit': rule['unit'], 'type': rule.get('element_type')})
             _syslog('D', 'Unit type is non-restartable', {'unit': rule['unit'], 'type': rule.get('element_type')})
+            return
+
+        if self.context.mode == 'global_user':
+            _syslog('D', 'Dependency restart skipped: not supported for global_user scope',
+                    {'unit': rule['unit']})
             return
 
         state = self._active_state(rule['unit'])
@@ -501,6 +525,9 @@ class _systemd_preferences_runtime:
             log('D244', {'unit': rule['unit'], 'state': rule['state']})
             exists = self._exists(rule['unit'])
             if not _rule_matches_apply_mode(rule, exists):
+                # Rule does not qualify for edit/state this run, but should
+                # still be checked for dependency-triggered restarts.
+                self.phase2_candidates.append(rule)
                 continue
             applicable_rules.append((rule, exists))
 
@@ -552,7 +579,7 @@ class _systemd_preferences_runtime:
                     'unit': unit_name,
                     'element_type': element_type,
                 }
-                self._restart(cleanup_rule)
+                self._stop(cleanup_rule)
 
     def _dependency_changed(self, dependency, username=None):
         dep_path = _expand_windows_var(dependency['path'], username)

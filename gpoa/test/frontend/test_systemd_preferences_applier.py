@@ -46,6 +46,7 @@ class _manager_stub:
         self.exists_calls = []
         self.apply_state_calls = []
         self.restart_calls = []
+        self.stop_calls = []
         self.reload_calls = 0
         self.call_order = []
 
@@ -66,12 +67,51 @@ class _manager_stub:
         self.call_order.append('restart:{}'.format(unit_name))
         self.restart_calls.append(unit_name)
 
+    def stop(self, unit_name):
+        self.call_order.append('stop:{}'.format(unit_name))
+        self.stop_calls.append(unit_name)
+
     def apply_state(self, unit_name, state, now):
         self.call_order.append('apply_state:{}'.format(unit_name))
         self.apply_state_calls.append((unit_name, state, now))
 
 
+def _stub_external_modules():
+    """Stub heavy external dependencies not available in unit test environment."""
+    if 'samba' not in sys.modules:
+        samba_stub = types.ModuleType('samba')
+        samba_stub.getopt = types.ModuleType('samba.getopt')
+        sys.modules['samba'] = samba_stub
+        sys.modules['samba.getopt'] = samba_stub.getopt
+
+    if 'util.samba' not in sys.modules:
+        util_samba = types.ModuleType('util.samba')
+
+        class _smbopts_stub:
+            def get_server_role(self):
+                return 'member server'
+
+        util_samba.smbopts = _smbopts_stub
+        sys.modules['util.samba'] = util_samba
+
+    if 'util' not in sys.modules:
+        util_pkg = types.ModuleType('util')
+        util_pkg.__path__ = [os.path.join(os.getcwd(), 'util')]
+        sys.modules['util'] = util_pkg
+
+    if 'gpoa' not in sys.modules:
+        gpoa_stub = types.ModuleType('gpoa')
+        gpoa_stub.__path__ = [os.getcwd()]
+        sys.modules['gpoa'] = gpoa_stub
+
+    if 'gpoa.messages' not in sys.modules:
+        msg_stub = types.ModuleType('gpoa.messages')
+        msg_stub.message_with_code = lambda code, *a, **kw: str(code)
+        sys.modules['gpoa.messages'] = msg_stub
+
+
 def _load_spa():
+    _stub_external_modules()
     if 'frontend' not in sys.modules:
         frontend_pkg = types.ModuleType('frontend')
         frontend_pkg.__path__ = [os.path.join(os.getcwd(), 'frontend')]
@@ -133,6 +173,67 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
         ])
 
         self.assertEqual(manager.apply_state_calls, [('exists.service', 'enable', False)])
+
+    def test_non_applicable_rules_still_reach_phase2_candidates(self):
+        # Rules that don't match apply_mode must still be checked for
+        # dependency-triggered restarts (phase2_candidates).
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(exists_map={'exists.service': True})
+        runtime.apply_rules([
+            {
+                'uid': '1',
+                'unit': 'exists.service',
+                'state': 'enable',
+                'now': False,
+                'apply_mode': 'if_missing',
+                'policy_target': 'machine',
+                'edit_mode': 'create',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': None,
+                'file_dependencies': [{'mode': 'changed', 'path': '/tmp/test.ini'}],
+                'element_type': 'service',
+            },
+        ])
+
+        self.assertEqual(len(runtime.phase2_candidates), 1)
+        self.assertEqual(runtime.phase2_candidates[0]['uid'], '1')
+        # State action must not have been applied (apply_mode didn't match)
+        self.assertEqual(runtime.systemd_manager.apply_state_calls, [])
+
+    def test_non_applicable_rule_triggers_dependency_restart(self):
+        # Service exists, apply_mode='if_missing' → edit skipped, but
+        # dependency change must still trigger a restart.
+        spa = _load_spa()
+
+        storage = _storage_stub()
+        runtime = spa._systemd_preferences_runtime(storage, 'Machine', spa._Context(mode='machine'))
+        runtime.systemd_manager = _manager_stub(
+            exists_map={'exists.service': True},
+            active_state_map={'exists.service': 'active'},
+        )
+        runtime.apply_rules([
+            {
+                'uid': '1',
+                'unit': 'exists.service',
+                'state': 'enable',
+                'now': False,
+                'apply_mode': 'if_missing',
+                'policy_target': 'machine',
+                'edit_mode': 'create',
+                'dropin_name': '50-gpo.conf',
+                'unit_file': None,
+                'file_dependencies': [{'mode': 'changed', 'path': '/tmp/test.ini'}],
+                'element_type': 'service',
+            },
+        ])
+
+        with unittest.mock.patch('frontend.systemd_preferences_applier.query', return_value=True):
+            runtime.post_restart()
+
+        self.assertIn('exists.service', runtime.systemd_manager.restart_calls)
 
     def test_edit_mode_create_or_override_writes_expected_paths(self):
         spa = _load_spa()
@@ -567,7 +668,7 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
 
             self.assertFalse(os.path.exists(managed))
             self.assertEqual(runtime.systemd_manager.reload_calls, 1)
-            self.assertNotIn('usb.device', runtime.systemd_manager.restart_calls)
+            self.assertNotIn('usb.device', runtime.systemd_manager.stop_calls)
 
     def test_cleanup_removed_rules_requires_marker_on_first_line(self):
         spa = _load_spa()
@@ -619,7 +720,7 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
 
             self.assertFalse(os.path.exists(managed))
             self.assertEqual(runtime.systemd_manager.reload_calls, 1)
-            self.assertEqual(runtime.systemd_manager.restart_calls, [])
+            self.assertEqual(runtime.systemd_manager.stop_calls, [])
 
     def test_write_rule_file_skips_symlink_target(self):
         spa = _load_spa()
