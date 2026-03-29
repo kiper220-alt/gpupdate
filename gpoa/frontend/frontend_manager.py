@@ -144,6 +144,10 @@ class frontend_manager:
         self.machine_appliers['ini'] = ini_applier(self.storage)
         self.machine_appliers['kde'] = kde_applier(self.storage)
         self.machine_appliers['package'] = package_applier(self.storage)
+        # systemd_preferences must be registered last: its post_restart() checks
+        # dependency paths that other appliers (e.g. ini) may have modified during
+        # the same apply cycle.  New appliers that write files must be added before
+        # this entry to ensure their changes are visible to the dependency journal.
         self.machine_appliers['systemd_preferences'] = systemd_preferences_applier(self.storage)
 
     def _init_user_appliers(self):
