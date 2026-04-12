@@ -51,7 +51,12 @@ def is_valid_unit_name(unit_name):
         return False
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in unit_name):
         return False
-    return bool(UNIT_NAME_RE.match(unit_name))
+    if not UNIT_NAME_RE.match(unit_name):
+        return False
+    name_part = unit_name.rsplit('.', 1)[0]
+    if name_part.startswith('-') or name_part.endswith('-'):
+        return False
+    return True
 
 
 def _import_dbus():
@@ -106,11 +111,12 @@ class SystemdManager:
         raise SystemdManagerError(self._global_output(result), action=action, unit=unit)
 
     def _unsupported_global_action(self, action, unit=None):
-        raise SystemdManagerError(
-            'systemctl --global does not support runtime action {}'.format(action),
-            action=action,
-            unit=unit,
-        )
+        log('W48', {
+            'reason': 'systemctl --global does not support runtime action {}'.format(action),
+            'action': action,
+            'unit': unit,
+        })
+        return
 
     def _load_unit(self, unit_name):
         try:
@@ -168,6 +174,7 @@ class SystemdManager:
     def start(self, unit_name):
         if self.mode == 'global_user':
             self._unsupported_global_action('start', unit=unit_name)
+            return
         try:
             self.manager.StartUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
@@ -176,6 +183,7 @@ class SystemdManager:
     def stop(self, unit_name):
         if self.mode == 'global_user':
             self._unsupported_global_action('stop', unit=unit_name)
+            return
         try:
             self.manager.StopUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
@@ -184,6 +192,7 @@ class SystemdManager:
     def restart(self, unit_name):
         if self.mode == 'global_user':
             self._unsupported_global_action('restart', unit=unit_name)
+            return
         try:
             self.manager.RestartUnit(unit_name, 'replace')
         except self.dbus.DBusException as exc:
