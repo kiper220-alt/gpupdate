@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Systemds clsid="{ROOT}" disabled="0">
   <Service clsid="{C1}" name="sshd" uid="{U1}">
-    <Properties unit="sshd" state="enable" now="1" applyMode="always" policyTarget="machine" editMode="override" dropInName="override.conf">
+    <Properties unit="sshd" state="enable" now="1" applyMode="always" policyTarget="machine" dropInName="override.conf">
       <UnitFile mode="text">[Service]
 Restart=always</UnitFile>
       <FileDependencies>

@@ -81,7 +81,7 @@ class GptSystemdsTestCase(unittest.TestCase):
         self.assertEqual(items[0].state, 'enable')
         self.assertEqual(items[0].apply_mode, 'always')
         self.assertEqual(items[0].policy_target, 'machine')
-        self.assertEqual(items[0].edit_mode, 'override')
+        self.assertEqual(items[0].edit_mode, 'create_or_override')
         self.assertEqual(items[0].dropin_name, 'override.conf')
         self.assertEqual(items[0].unit_file_mode, 'text')
         self.assertEqual(

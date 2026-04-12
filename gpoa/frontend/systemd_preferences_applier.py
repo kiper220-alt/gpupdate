@@ -42,7 +42,6 @@ from gpt.systemds_constants import (
     NON_RESTARTABLE_TYPES,
     VALID_APPLY_MODES,
     VALID_DEP_MODES,
-    VALID_EDIT_MODES,
     VALID_POLICY_TARGETS,
     VALID_STATES,
 )
@@ -162,12 +161,21 @@ def _is_valid_dependency_path(path, policy_target):
     return os.path.isabs(expanded)
 
 
+def _derive_edit_mode(apply_mode):
+    if apply_mode == 'always':
+        return 'create_or_override'
+    elif apply_mode == 'if_exists':
+        return 'override'
+    elif apply_mode == 'if_missing':
+        return 'create'
+    return 'create_or_override'
+
+
 def _normalize_rule(item):
     unit = item.get('unit')
     state = item.get('state')
     apply_mode = item.get('apply_mode', item.get('applyMode', 'always'))
     policy_target = item.get('policy_target', item.get('policyTarget', 'machine'))
-    edit_mode = item.get('edit_mode', item.get('editMode', 'override'))
     uid = item.get('uid')
 
     if not unit or state not in VALID_STATES:
@@ -179,8 +187,6 @@ def _normalize_rule(item):
         return None
     if policy_target not in VALID_POLICY_TARGETS:
         return None
-    if edit_mode not in VALID_EDIT_MODES:
-        return None
     if not uid:
         return None
 
@@ -189,12 +195,12 @@ def _normalize_rule(item):
         dependencies = []
     if len(dependencies) > MAX_DEPENDENCIES_PER_RULE:
         log('W47', {
-            'reason': 'Too many file dependencies',
+            'reason': 'Too many file dependencies, truncating',
             'unit': unit,
             'count': len(dependencies),
             'limit': MAX_DEPENDENCIES_PER_RULE,
         })
-        return None
+        dependencies = dependencies[:MAX_DEPENDENCIES_PER_RULE]
 
     valid_dependencies = []
     for dep in dependencies:
@@ -237,7 +243,7 @@ def _normalize_rule(item):
         'remove_policy': _as_bool(item.get('remove_policy', item.get('removePolicy', False))),
         'apply_mode': apply_mode,
         'policy_target': policy_target,
-        'edit_mode': edit_mode,
+        'edit_mode': _derive_edit_mode(apply_mode),
         'dropin_name': str(dropin_name),
         'unit_file': unit_file,
         'file_dependencies': valid_dependencies,

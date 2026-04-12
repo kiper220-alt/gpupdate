@@ -32,7 +32,6 @@ from .systemds_constants import (
     UNIT_NAME_RE,
     VALID_APPLY_MODES,
     VALID_DEP_MODES,
-    VALID_EDIT_MODES,
     VALID_POLICY_TARGETS,
     VALID_STATES,
 )
@@ -115,12 +114,27 @@ def _has_control_chars(value):
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in str(value))
 
 
+def _derive_edit_mode(apply_mode):
+    if apply_mode == 'always':
+        return 'create_or_override'
+    elif apply_mode == 'if_exists':
+        return 'override'
+    elif apply_mode == 'if_missing':
+        return 'create'
+    return 'create_or_override'
+
+
 def _is_valid_unit_name(value):
     if not _is_safe_component(value):
         return False
     if _has_control_chars(value):
         return False
-    return bool(UNIT_NAME_RE.match(str(value)))
+    if not UNIT_NAME_RE.match(str(value)):
+        return False
+    name_part = str(value).rsplit('.', 1)[0]
+    if name_part.startswith('-') or name_part.endswith('-'):
+        return False
+    return True
 
 
 def _is_valid_dropin_name(value):
@@ -199,12 +213,12 @@ def _parse_file_dependencies(properties, policy_target, unit):
 
     dependency_items = list(dependencies.findall('Dependency'))
     if len(dependency_items) > MAX_DEPENDENCIES_PER_RULE:
-        _invalid_entry('Too many dependency entries', {
+        _invalid_entry('Too many dependency entries, truncating', {
             'unit': unit,
             'count': len(dependency_items),
             'limit': MAX_DEPENDENCIES_PER_RULE,
         })
-        return file_dependencies
+        dependency_items = dependency_items[:MAX_DEPENDENCIES_PER_RULE]
 
     for dependency in dependency_items:
         mode = dependency.get('mode')
@@ -239,7 +253,6 @@ def _parse_policy_element(policy_element):
     state = properties.get('state')
     apply_mode = properties.get('applyMode', 'always')
     policy_target = properties.get('policyTarget', 'machine')
-    edit_mode = properties.get('editMode', 'override')
 
     if not unit:
         _invalid_entry('Missing unit attribute', {'element': element_name})
@@ -256,10 +269,6 @@ def _parse_policy_element(policy_element):
     if policy_target not in VALID_POLICY_TARGETS:
         _invalid_entry('Invalid policyTarget', {'element': element_name, 'policy_target': policy_target, 'unit': unit})
         return None
-    if edit_mode not in VALID_EDIT_MODES:
-        _invalid_entry('Invalid editMode', {'element': element_name, 'edit_mode': edit_mode, 'unit': unit})
-        return None
-
     uid = policy_element.get('uid')
     clsid = policy_element.get('clsid')
     name = policy_element.get('name')
@@ -305,7 +314,7 @@ def _parse_policy_element(policy_element):
     policy.now = _as_bool(properties.get('now'), default=False)
     policy.apply_mode = apply_mode
     policy.policy_target = policy_target
-    policy.edit_mode = edit_mode
+    policy.edit_mode = _derive_edit_mode(apply_mode)
     dropin_name = properties.get('dropInName', DEFAULT_DROPIN_NAME) or DEFAULT_DROPIN_NAME
     if not _is_valid_dropin_name(dropin_name):
         _invalid_entry('Invalid dropInName', {'element': element_name, 'dropInName': dropin_name, 'unit': unit})
