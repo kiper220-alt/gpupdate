@@ -447,7 +447,7 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             'uid': '14',
         })
 
-    def test_normalize_rule_rejects_too_many_dependencies(self):
+    def test_normalize_rule_truncates_too_many_dependencies(self):
         spa = _load_spa()
 
         too_many = [{'mode': 'changed', 'path': '/etc/demo{}'.format(idx)} for idx in range(64)]
@@ -457,11 +457,11 @@ class SystemdPreferencesApplierTestCase(unittest.TestCase):
             'state': 'as_is',
             'apply_mode': 'always',
             'policy_target': 'machine',
-            'edit_mode': 'override',
             'dropin_name': '50-gpo.conf',
             'file_dependencies': too_many,
         })
-        self.assertIsNone(normalized)
+        self.assertIsNotNone(normalized)
+        self.assertEqual(len(normalized['file_dependencies']), 32)
 
     def test_normalize_rule_filters_invalid_dependency_paths(self):
         spa = _load_spa()
